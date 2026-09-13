@@ -1,0 +1,938 @@
+#!/usr/bin/env python3
+"""pid-robot — ajusta ao vivo o PID do robô equilibrista pela porta serial.
+
+Abre uma interface no terminal com os valores do PID. Cada valor enviado ao
+robô fica guardado e volta a aparecer na próxima vez que o programa abrir.
+
+Só usa a biblioteca padrão do Python (termios, select): não precisa de pip.
+
+Conversa com o sketch robo_equilibrista.ino usando os comandos que ele entende
+("kp 20", "valores", "marcar_equilibrio"...) e lendo duas linhas que ele imprime:
+
+  ajustes:     # kp=20.00  ki=0.00  kd=0.800  angulo_equilibrio=0.00  pwm_minimo=40  angulo_queda=35.0  peso_giroscopio=0.980  telemetria=ligada
+  telemetria:  angulo:-1.23,angulo_equilibrio:0.00,termo_P:-24.6,termo_I:0.0,termo_D:3.1,comando_motor:-21
+
+Se o formato dessas linhas mudar no sketch, ajuste este programa também.
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import signal
+import sys
+import termios
+import time
+import tty
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+
+# =============================================================================
+#  CONFIGURAÇÃO
+# =============================================================================
+
+VELOCIDADE_DA_SERIAL = termios.B115200          # a mesma do Serial.begin() no sketch
+PADROES_DE_PORTA = ("/dev/ttyUSB*", "/dev/ttyACM*")
+
+PASTA_DE_CONFIGURACAO = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pid-robot"
+ARQUIVO_DO_ULTIMO_ENVIO = PASTA_DE_CONFIGURACAO / "ultimo-envio.json"
+
+# Quando o programa abre a porta, o Nano reinicia (o sinal DTR da USB faz isso).
+# Ele leva ~1 s no bootloader e ~2 s calibrando o giroscópio antes de responder.
+SEGUNDOS_ATE_PEDIR_VALORES = 4.0
+SEGUNDOS_ENTRE_PEDIDOS_DE_VALORES = 3.0
+SEGUNDOS_ENTRE_TENTATIVAS_DE_CONEXAO = 1.5
+SEGUNDOS_ENTRE_COMANDOS = 0.08       # espaço entre comandos, para não lotar o buffer do Nano
+SEGUNDOS_DE_PAUSA_NO_ENVIO_AUTOMATICO = 0.25
+SEGUNDOS_ATE_A_TELEMETRIA_FICAR_VELHA = 1.5
+SEGUNDOS_AGUARDANDO_CONFIRMACAO = 1.0
+
+LIMITE_DO_ANGULO_DE_EQUILIBRIO = 35.0
+INTERVALO_ENTRE_AMOSTRAS_DO_SKETCH = 0.005   # 200 amostras por segundo, como no sketch
+LARGURA_DA_BARRA = 21                # ímpar, para existir um centro exato
+
+
+@dataclass(frozen=True)
+class Parametro:
+    nome: str                        # o mesmo nome do comando no sketch
+    titulo: str
+    casas_decimais: int              # as mesmas casas que o sketch usa ao imprimir
+    passo: float                     # ←/→
+    passo_grosso: float              # PgUp/PgDn
+    minimo: float
+    maximo: float
+    inicio_da_barra: float           # faixa desenhada na barra: a faixa útil na prática
+    fim_da_barra: float
+    centrado: bool                   # barra com zero no meio (valores negativos fazem sentido)
+    valor_padrao_do_sketch: float
+    explicacao: Callable[[float], str]
+
+
+PARAMETROS = [
+    Parametro("kp", "ganho proporcional", 2, 0.5, 5.0, 0.0, 1000.0, 0.0, 100.0, False, 20.0,
+              lambda v: f"1 grau de inclinação vira {v:.1f} de comando no motor"),
+    Parametro("ki", "ganho integral", 2, 1.0, 10.0, 0.0, 10000.0, 0.0, 300.0, False, 0.0,
+              lambda v: f"1 grau mantido por 1 segundo acumula {v:.1f} de comando"),
+    Parametro("kd", "ganho derivativo", 3, 0.05, 0.5, 0.0, 100.0, 0.0, 5.0, False, 0.8,
+              lambda v: f"caindo a 100 graus/s vira {v * 100:.0f} de comando"),
+    Parametro("angulo_equilibrio", "ângulo de equilíbrio", 2, 0.1, 1.0,
+              -LIMITE_DO_ANGULO_DE_EQUILIBRIO, LIMITE_DO_ANGULO_DE_EQUILIBRIO,
+              -10.0, 10.0, True, 0.0,
+              lambda v: f"o robô tenta ficar parado inclinado {v:+.2f}°"),
+    Parametro("pwm_minimo", "PWM mínimo do motor", 0, 1.0, 10.0, 0.0, 254.0, 0.0, 255.0, False, 40.0,
+              lambda v: f"qualquer comando começa em {v:.0f} de PWM, para vencer a zona morta"),
+    # Os limites de angulo_queda e peso_giroscopio são os mesmos do constrain() no sketch.
+    Parametro("angulo_queda", "ângulo de queda", 1, 1.0, 5.0, 5.0, 80.0, 0.0, 80.0, False, 35.0,
+              lambda v: f"passou de {v:.0f}° longe do equilíbrio: desliga o motor e espera ser levantado"),
+    Parametro("peso_giroscopio", "peso do giroscópio no filtro", 3, 0.005, 0.02, 0.0, 1.0, 0.9, 1.0, False, 0.98,
+              lambda v: explicar_peso_do_giroscopio(v)),
+]
+PARAMETRO_POR_NOME = {parametro.nome: parametro for parametro in PARAMETROS}
+
+
+def explicar_peso_do_giroscopio(peso: float) -> str:
+    mistura = f"{peso * 100:.1f}% giroscópio + {(1 - peso) * 100:.1f}% acelerômetro"
+    if peso >= 1.0:
+        return f"{mistura}: o acelerômetro nunca corrige, o ângulo vai escorregar"
+    # Constante de tempo do filtro complementar: intervalo × peso / (1 − peso).
+    constante_de_tempo = INTERVALO_ENTRE_AMOSTRAS_DO_SKETCH * peso / (1 - peso)
+    return f"{mistura}: o acelerômetro corrige o ângulo em ~{constante_de_tempo * 1000:.0f} ms"
+
+# Nomes das variáveis no sketch, para imprimir o trecho de código ao sair.
+VARIAVEL_NO_SKETCH = {
+    "kp": "float Kp",
+    "ki": "float Ki",
+    "kd": "float Kd",
+    "angulo_equilibrio": "float anguloDeEquilibrio",
+    "pwm_minimo": "int pwmMinimo",
+    "angulo_queda": "float anguloDeQueda",
+    "peso_giroscopio": "float pesoDoGiroscopio",
+}
+
+
+# =============================================================================
+#  CORES E PEQUENAS AJUDAS
+# =============================================================================
+
+RESET = "\033[0m"
+TITULO = "\033[1;36m"
+SUCESSO = "\033[1;32m"
+AVISO = "\033[1;33m"
+ERRO = "\033[1;31m"
+APAGADO = "\033[2;37m"
+NEGRITO = "\033[1m"
+INVERTIDO = "\033[7m"
+
+usar_cor = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM", "dumb") != "dumb"
+
+
+def pintar(cor: str, texto: str) -> str:
+    return f"{cor}{texto}{RESET}" if usar_cor else texto
+
+
+def limitar(valor: float, minimo: float, maximo: float) -> float:
+    return max(minimo, min(maximo, valor))
+
+
+def formatar(parametro: Parametro, valor: float) -> str:
+    return f"{valor:.{parametro.casas_decimais}f}"
+
+
+def valores_iguais(parametro: Parametro, a: float, b: float) -> bool:
+    # Compara só até as casas decimais que o sketch imprime.
+    return formatar(parametro, a) == formatar(parametro, b)
+
+
+def hora_atual() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+# =============================================================================
+#  PORTA SERIAL (sem pyserial: termios direto)
+# =============================================================================
+
+class PortaSerial:
+    def __init__(self, caminho: str):
+        self.caminho = caminho
+        self.resto_da_leitura = b""
+        self.descritor = os.open(caminho, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            # Uso exclusivo: impede que outro programa (o Monitor Serial da IDE,
+            # por exemplo) leia a mesma porta e "roube" metade das linhas.
+            fcntl.ioctl(self.descritor, termios.TIOCEXCL)
+
+            tty.setraw(self.descritor)
+            atributos = termios.tcgetattr(self.descritor)
+            atributos[2] |= termios.CLOCAL | termios.CREAD
+            atributos[4] = VELOCIDADE_DA_SERIAL
+            atributos[5] = VELOCIDADE_DA_SERIAL
+            termios.tcsetattr(self.descritor, termios.TCSANOW, atributos)
+            termios.tcflush(self.descritor, termios.TCIOFLUSH)
+        except BaseException:
+            os.close(self.descritor)
+            raise
+
+    def ler_linhas_completas(self) -> list[str]:
+        """Devolve as linhas que chegaram inteiras. Levanta OSError se a porta sumiu."""
+        try:
+            dados = os.read(self.descritor, 4096)
+        except BlockingIOError:
+            return []
+        if not dados:
+            # select() disse que havia algo para ler e não veio nada: desconectou.
+            raise OSError(errno.EIO, "a porta foi fechada")
+
+        self.resto_da_leitura += dados
+        *linhas, self.resto_da_leitura = self.resto_da_leitura.split(b"\n")
+        return [linha.decode("utf-8", "replace").rstrip("\r") for linha in linhas]
+
+    def escrever_linha(self, texto: str) -> None:
+        os.write(self.descritor, (texto + "\n").encode("ascii"))
+
+    def fechar(self) -> None:
+        # Tira o uso exclusivo antes de fechar: se outro processo ainda estiver
+        # com a porta aberta, o bloqueio ficaria preso e ninguém mais conseguiria abri-la.
+        try:
+            fcntl.ioctl(self.descritor, termios.TIOCNXCL)
+        except OSError:
+            pass
+        try:
+            os.close(self.descritor)
+        except OSError:
+            pass
+
+
+# =============================================================================
+#  O PROGRAMA
+# =============================================================================
+
+class AjusteDoPid:
+    def __init__(self, porta_escolhida_na_linha_de_comando: str | None):
+        self.porta_escolhida_na_linha_de_comando = porta_escolhida_na_linha_de_comando
+        self.mensagens: deque[tuple[str, str, str]] = deque(maxlen=5)   # (hora, cor, texto)
+
+        # --- valores ---------------------------------------------------------
+        # Na interface: o que aparece na tela (pode ainda não ter sido enviado).
+        # Enviados:     o último valor mandado ao robô (é o que fica guardado).
+        # No robô:      o que o próprio robô confirmou na última linha de ajustes.
+        self.valores_enviados = {p.nome: p.valor_padrao_do_sketch for p in PARAMETROS}
+        self.ultima_porta_usada: str | None = None
+        self.envio_automatico = False
+        self.existe_ultimo_envio_guardado = self.carregar_ultimo_envio()
+        self.valores_na_interface = dict(self.valores_enviados)
+        self.valores_no_robo: dict[str, float] = {}
+        self.robo_informou_ajustes = False          # já chegou alguma linha "# kp=..." desde a conexão
+        self.momento_do_envio: dict[str, float] = {}
+        self.envio_automatico_agendado_para: dict[str, float] = {}
+
+        # --- tela ------------------------------------------------------------
+        self.indice_selecionado = 0
+        self.texto_em_edicao: str | None = None
+        self.rodando = True
+        self.precisa_redesenhar = True
+        self.precisa_limpar_a_tela = True
+
+        # --- robô ------------------------------------------------------------
+        self.porta: PortaSerial | None = None
+        self.conexao_pausada_pelo_usuario = False
+        self.proxima_tentativa_de_conexao = 0.0
+        self.ultimo_erro_de_conexao = ""
+        self.fila_de_comandos: deque[str] = deque()
+        self.momento_do_ultimo_comando = 0.0
+        self.sincronizacao_pendente = False
+        self.momento_de_pedir_valores = 0.0
+        self.aguardando_marcacao_de_equilibrio = False
+        self.telemetria: dict[str, float] = {}
+        self.momento_da_ultima_telemetria = 0.0
+        self.telemetria_ligada: bool | None = None
+        self.robo_equilibrando: bool | None = None
+
+    # -------------------------------------------------------------------------
+    #  Último envio guardado em disco
+    # -------------------------------------------------------------------------
+
+    def carregar_ultimo_envio(self) -> bool:
+        try:
+            dados = json.loads(ARQUIVO_DO_ULTIMO_ENVIO.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError) as erro:
+            self.avisar(ERRO, f"não consegui ler {ARQUIVO_DO_ULTIMO_ENVIO}: {erro}")
+            return False
+
+        for parametro in PARAMETROS:
+            valor = dados.get("valores", {}).get(parametro.nome)
+            if isinstance(valor, (int, float)):
+                self.valores_enviados[parametro.nome] = limitar(float(valor), parametro.minimo, parametro.maximo)
+        self.ultima_porta_usada = dados.get("porta")
+        self.envio_automatico = bool(dados.get("envio_automatico", False))
+        return True
+
+    def guardar_ultimo_envio(self) -> None:
+        dados = {
+            "porta": self.porta.caminho if self.porta else self.ultima_porta_usada,
+            "envio_automatico": self.envio_automatico,
+            "valores": {p.nome: (int(self.valores_enviados[p.nome]) if p.casas_decimais == 0
+                                 else round(self.valores_enviados[p.nome], p.casas_decimais))
+                        for p in PARAMETROS},
+        }
+        try:
+            PASTA_DE_CONFIGURACAO.mkdir(parents=True, exist_ok=True)
+            temporario = ARQUIVO_DO_ULTIMO_ENVIO.with_suffix(".tmp")
+            temporario.write_text(json.dumps(dados, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            os.replace(temporario, ARQUIVO_DO_ULTIMO_ENVIO)   # troca de uma vez: nunca fica pela metade
+            self.existe_ultimo_envio_guardado = True
+        except OSError as erro:
+            self.avisar(ERRO, f"não consegui guardar o último envio: {erro}")
+
+    # -------------------------------------------------------------------------
+    #  Conexão com o robô
+    # -------------------------------------------------------------------------
+
+    def escolher_porta(self) -> str | None:
+        if self.porta_escolhida_na_linha_de_comando:
+            return self.porta_escolhida_na_linha_de_comando if os.path.exists(self.porta_escolhida_na_linha_de_comando) else None
+
+        encontradas = sorted(caminho for padrao in PADROES_DE_PORTA for caminho in glob.glob(padrao))
+        if self.ultima_porta_usada in encontradas:
+            return self.ultima_porta_usada
+        return encontradas[0] if encontradas else None
+
+    def tentar_conectar(self, agora: float) -> None:
+        if self.porta or self.conexao_pausada_pelo_usuario or agora < self.proxima_tentativa_de_conexao:
+            return
+        self.proxima_tentativa_de_conexao = agora + SEGUNDOS_ENTRE_TENTATIVAS_DE_CONEXAO
+
+        caminho = self.escolher_porta()
+        if caminho is None:
+            return
+
+        try:
+            self.porta = PortaSerial(caminho)
+        except PermissionError:
+            self.avisar_erro_de_conexao(f"sem permissão para abrir {caminho}: adicione seu usuário ao grupo dialout")
+            return
+        except OSError as erro:
+            if erro.errno == errno.EBUSY:
+                self.avisar_erro_de_conexao(f"{caminho} está ocupada: feche o Monitor Serial da IDE")
+            else:
+                self.avisar_erro_de_conexao(f"não consegui abrir {caminho}: {erro.strerror}")
+            return
+
+        self.ultimo_erro_de_conexao = ""
+        self.ultima_porta_usada = caminho
+        self.valores_no_robo.clear()
+        self.robo_informou_ajustes = False
+        self.telemetria.clear()
+        self.telemetria_ligada = None
+        self.robo_equilibrando = None
+        self.fila_de_comandos.clear()
+        self.sincronizacao_pendente = True
+        self.momento_de_pedir_valores = agora + SEGUNDOS_ATE_PEDIR_VALORES
+        self.avisar(SUCESSO, f"conectado em {caminho}; esperando o robô iniciar…")
+
+    def avisar_erro_de_conexao(self, texto: str) -> None:
+        # A conexão é tentada a cada 1,5 s; só avisa quando o erro muda.
+        if texto != self.ultimo_erro_de_conexao:
+            self.ultimo_erro_de_conexao = texto
+            self.avisar(ERRO, texto)
+
+    def desconectar(self, motivo: str, cor: str = ERRO) -> None:
+        if self.porta:
+            self.porta.fechar()
+            self.porta = None
+        self.fila_de_comandos.clear()
+        self.sincronizacao_pendente = False
+        self.valores_no_robo.clear()          # sem conexão, não dá para afirmar o que o robô tem
+        self.robo_informou_ajustes = False
+        self.telemetria_ligada = None
+        self.robo_equilibrando = None
+        self.avisar(cor, motivo)
+
+    def alternar_conexao(self) -> None:
+        if self.porta:
+            self.conexao_pausada_pelo_usuario = True
+            self.desconectar("porta liberada: já dá para gravar o sketch pela IDE (c conecta de novo)", APAGADO)
+        else:
+            self.conexao_pausada_pelo_usuario = False
+            self.proxima_tentativa_de_conexao = 0.0
+            self.ultimo_erro_de_conexao = ""
+
+    # -------------------------------------------------------------------------
+    #  Envio de comandos
+    # -------------------------------------------------------------------------
+
+    def enfileirar_comando(self, comando: str) -> bool:
+        if not self.porta:
+            self.avisar(ERRO, "robô desconectado: nada foi enviado")
+            return False
+        self.fila_de_comandos.append(comando)
+        return True
+
+    def despachar_fila_de_comandos(self, agora: float) -> None:
+        if not self.porta or not self.fila_de_comandos:
+            return
+        if agora - self.momento_do_ultimo_comando < SEGUNDOS_ENTRE_COMANDOS:
+            return
+        comando = self.fila_de_comandos.popleft()
+        try:
+            self.porta.escrever_linha(comando)
+        except OSError as erro:
+            self.desconectar(f"falha ao enviar \"{comando}\": {erro.strerror or erro}")
+            return
+        self.momento_do_ultimo_comando = agora
+
+    def enviar_parametro(self, parametro: Parametro) -> None:
+        valor = self.valores_na_interface[parametro.nome]
+        if not self.enfileirar_comando(f"{parametro.nome} {formatar(parametro, valor)}"):
+            return
+        self.valores_enviados[parametro.nome] = valor
+        self.momento_do_envio[parametro.nome] = time.monotonic()
+        self.envio_automatico_agendado_para.pop(parametro.nome, None)
+        self.guardar_ultimo_envio()
+
+    def enviar_todos(self) -> None:
+        if not self.porta:
+            self.avisar(ERRO, "robô desconectado: nada foi enviado")
+            return
+        for parametro in PARAMETROS:
+            self.enviar_parametro(parametro)
+        self.avisar(SUCESSO, "todos os valores enviados")
+
+    def despachar_envios_automaticos(self, agora: float) -> None:
+        # Espera o usuário parar de apertar a seta antes de mandar, para não
+        # disparar dezenas de comandos seguidos.
+        for nome, momento in list(self.envio_automatico_agendado_para.items()):
+            if agora >= momento:
+                del self.envio_automatico_agendado_para[nome]
+                self.enviar_parametro(PARAMETRO_POR_NOME[nome])
+
+    # -------------------------------------------------------------------------
+    #  O que o robô manda
+    # -------------------------------------------------------------------------
+
+    def tratar_linha_do_robo(self, linha: str, agora: float) -> None:
+        if linha.startswith("# kp="):
+            self.tratar_linha_de_ajustes(linha, agora)
+        elif linha.startswith("angulo:"):
+            self.tratar_linha_de_telemetria(linha, agora)
+        elif linha.startswith("#"):
+            texto = linha.lstrip("# ").strip()
+            if not texto or linha.startswith("#   ") or texto == "Comandos:":
+                return                                   # lista de ajuda do sketch: não precisa aparecer
+            if texto.startswith("Robo equilibrista iniciando"):
+                # O robô reiniciou (bateria, botão reset...): perdeu os valores enviados.
+                self.valores_no_robo.clear()
+                self.robo_informou_ajustes = False
+                self.robo_equilibrando = False
+                self.sincronizacao_pendente = True
+                self.momento_de_pedir_valores = agora + SEGUNDOS_ATE_PEDIR_VALORES - 1.0
+            elif texto.startswith("Em pe"):
+                self.robo_equilibrando = True
+            elif texto.startswith(("Caiu", "Falha")):
+                self.robo_equilibrando = False
+            cor = ERRO if texto.startswith(("ERRO", "Falha", "Comando desconhecido", "Faltou")) else ""
+            self.avisar(cor, f"robô: {texto}")
+
+    def tratar_linha_de_ajustes(self, linha: str, agora: float) -> None:
+        for nome, texto in re.findall(r"(\w+)=(\S+)", linha):
+            if nome == "telemetria":
+                self.telemetria_ligada = texto == "ligada"
+            elif nome in PARAMETRO_POR_NOME:
+                try:
+                    self.valores_no_robo[nome] = float(texto)
+                except ValueError:
+                    pass
+
+        if "telemetria=" not in linha:
+            return                                        # linha cortada: espera a próxima
+        self.robo_informou_ajustes = True
+
+        if self.aguardando_marcacao_de_equilibrio:
+            self.aguardando_marcacao_de_equilibrio = False
+            angulo = self.valores_no_robo["angulo_equilibrio"]
+            self.valores_na_interface["angulo_equilibrio"] = angulo
+            self.valores_enviados["angulo_equilibrio"] = angulo
+            self.guardar_ultimo_envio()
+            self.avisar(SUCESSO, f"equilíbrio marcado em {angulo:+.2f}°")
+
+        if self.sincronizacao_pendente:
+            self.sincronizar_com_o_robo(agora)
+
+    def sincronizar_com_o_robo(self, agora: float) -> None:
+        self.sincronizacao_pendente = False
+
+        if not self.existe_ultimo_envio_guardado:
+            # Primeiro uso: o ponto de partida são os valores gravados no sketch.
+            for parametro in self.parametros_que_o_robo_conhece():
+                nome = parametro.nome
+                valor_do_robo = self.valores_no_robo[nome]
+                if valores_iguais(parametro, self.valores_na_interface[nome], self.valores_enviados[nome]):
+                    self.valores_na_interface[nome] = valor_do_robo   # não sobrescreve o que já foi editado
+                self.valores_enviados[nome] = valor_do_robo
+            self.guardar_ultimo_envio()
+            self.avisar(SUCESSO, "primeiro uso: valores lidos do robô e guardados")
+            self.avisar_se_o_sketch_for_antigo()
+            return
+
+        # O Nano reinicia ao abrir a porta e volta aos valores do sketch.
+        # Reenvia o último envio para ele ficar como estava.
+        diferentes = [p for p in self.parametros_que_o_robo_conhece()
+                      if not valores_iguais(p, self.valores_no_robo[p.nome], self.valores_enviados[p.nome])]
+        for parametro in diferentes:
+            self.enfileirar_comando(f"{parametro.nome} {formatar(parametro, self.valores_enviados[parametro.nome])}")
+            self.momento_do_envio[parametro.nome] = agora
+        if diferentes:
+            self.avisar(SUCESSO, f"robô pronto: último envio reaplicado ({len(diferentes)} valor(es))")
+        else:
+            self.avisar(SUCESSO, "robô pronto: já estava com os valores do último envio")
+        self.avisar_se_o_sketch_for_antigo()
+
+    def parametros_que_o_robo_conhece(self) -> list[Parametro]:
+        return [p for p in PARAMETROS if p.nome in self.valores_no_robo]
+
+    def avisar_se_o_sketch_for_antigo(self) -> None:
+        desconhecidos = [p.nome for p in PARAMETROS if p.nome not in self.valores_no_robo]
+        if desconhecidos:
+            self.avisar(AVISO, f"o sketch gravado no robô não conhece {', '.join(desconhecidos)}: grave a versão nova")
+
+    def tratar_linha_de_telemetria(self, linha: str, agora: float) -> None:
+        for par in linha.split(","):
+            nome, _, texto = par.partition(":")
+            try:
+                self.telemetria[nome] = float(texto)
+            except ValueError:
+                pass
+        self.momento_da_ultima_telemetria = agora
+        self.telemetria_ligada = True
+
+    def pedir_valores_se_preciso(self, agora: float) -> None:
+        # Se o robô não se apresentou sozinho (nem sempre ele reinicia ao
+        # conectar), pergunta os valores com o comando "valores".
+        if self.porta and self.sincronizacao_pendente and agora >= self.momento_de_pedir_valores:
+            self.momento_de_pedir_valores = agora + SEGUNDOS_ENTRE_PEDIDOS_DE_VALORES
+            self.enfileirar_comando("valores")
+
+    # -------------------------------------------------------------------------
+    #  Teclado
+    # -------------------------------------------------------------------------
+
+    def tratar_tecla(self, tecla: str) -> None:
+        parametro = PARAMETROS[self.indice_selecionado]
+        e_digito = len(tecla) == 1 and tecla in "0123456789-.,"
+
+        if self.texto_em_edicao is not None:
+            if tecla in ("\r", "\n"):
+                self.confirmar_edicao(parametro)
+            elif tecla == "ESC":
+                self.texto_em_edicao = None
+            elif tecla in ("\x7f", "\b"):
+                self.texto_em_edicao = self.texto_em_edicao[:-1]
+            elif e_digito and len(self.texto_em_edicao) < 10:
+                self.texto_em_edicao += "." if tecla == "," else tecla
+            elif tecla in ("CIMA", "BAIXO"):
+                self.texto_em_edicao = None
+                self.mover_selecao(-1 if tecla == "CIMA" else 1)
+            return
+
+        if tecla in ("q", "Q", "ESC"):
+            self.rodando = False
+        elif tecla == "CIMA":
+            self.mover_selecao(-1)
+        elif tecla == "BAIXO":
+            self.mover_selecao(1)
+        elif tecla == "DIREITA":
+            self.ajustar(parametro, parametro.passo)
+        elif tecla == "ESQUERDA":
+            self.ajustar(parametro, -parametro.passo)
+        elif tecla == "PGUP":
+            self.ajustar(parametro, parametro.passo_grosso)
+        elif tecla == "PGDN":
+            self.ajustar(parametro, -parametro.passo_grosso)
+        elif e_digito:
+            self.texto_em_edicao = "." if tecla == "," else tecla
+        elif tecla in ("\r", "\n"):
+            self.enviar_parametro(parametro)
+        elif tecla in ("e", "E"):
+            self.enviar_todos()
+        elif tecla in ("u", "U"):
+            self.valores_na_interface = dict(self.valores_enviados)
+            self.envio_automatico_agendado_para.clear()
+            self.avisar(APAGADO, "alterações descartadas: de volta ao último envio")
+        elif tecla in ("m", "M"):
+            if self.enfileirar_comando("marcar_equilibrio"):
+                self.aguardando_marcacao_de_equilibrio = True
+        elif tecla in ("a", "A"):
+            self.envio_automatico = not self.envio_automatico
+            self.guardar_ultimo_envio()
+            self.avisar(APAGADO, f"envio automático {'ligado' if self.envio_automatico else 'desligado'}")
+        elif tecla in ("t", "T"):
+            self.enfileirar_comando("telemetria")
+        elif tecla in ("c", "C"):
+            self.alternar_conexao()
+
+    def mover_selecao(self, direcao: int) -> None:
+        self.indice_selecionado = int(limitar(self.indice_selecionado + direcao, 0, len(PARAMETROS) - 1))
+
+    def ajustar(self, parametro: Parametro, quanto: float) -> None:
+        atual = self.valores_na_interface[parametro.nome]
+        novo = round(limitar(atual + quanto, parametro.minimo, parametro.maximo), parametro.casas_decimais)
+        self.valores_na_interface[parametro.nome] = novo
+        if self.envio_automatico:
+            self.envio_automatico_agendado_para[parametro.nome] = time.monotonic() + SEGUNDOS_DE_PAUSA_NO_ENVIO_AUTOMATICO
+
+    def confirmar_edicao(self, parametro: Parametro) -> None:
+        texto = self.texto_em_edicao or ""
+        self.texto_em_edicao = None
+        try:
+            valor = float(texto)
+        except ValueError:
+            self.avisar(ERRO, f"\"{texto}\" não é um número")
+            return
+        valor_limitado = round(limitar(valor, parametro.minimo, parametro.maximo), parametro.casas_decimais)
+        if valor_limitado != round(valor, parametro.casas_decimais):
+            self.avisar(AVISO, f"{parametro.nome} vai de {formatar(parametro, parametro.minimo)} "
+                               f"a {formatar(parametro, parametro.maximo)}: usei {formatar(parametro, valor_limitado)}")
+        self.valores_na_interface[parametro.nome] = valor_limitado
+        self.enviar_parametro(parametro)
+
+    # -------------------------------------------------------------------------
+    #  Tela
+    # -------------------------------------------------------------------------
+
+    def avisar(self, cor: str, texto: str) -> None:
+        self.mensagens.append((hora_atual(), cor, texto))
+        self.precisa_redesenhar = True
+
+    def desenhar(self) -> None:
+        agora = time.monotonic()
+        parametro = PARAMETROS[self.indice_selecionado]
+        valor = self.valores_na_interface[parametro.nome]
+
+        linhas = [
+            pintar(TITULO, " Ajuste do PID — robô equilibrista"),
+            self.linha_da_conexao(),
+            "",
+            *(self.linha_do_parametro(indice, p, agora) for indice, p in enumerate(PARAMETROS)),
+            "",
+            pintar(APAGADO, f"   {parametro.titulo}: {parametro.explicacao(valor)}"),
+            "",
+            *self.linhas_do_robo(agora),
+            "",
+            *self.linhas_das_mensagens(),
+            "",
+            *self.linhas_do_rodape(),
+        ]
+
+        inicio = "\033[2J\033[H" if self.precisa_limpar_a_tela else "\033[H"
+        self.precisa_limpar_a_tela = False
+        tela = inicio + "".join(linha + "\033[K\n" for linha in linhas) + "\033[J"
+        os.write(sys.stdout.fileno(), tela.encode("utf-8"))
+        self.precisa_redesenhar = False
+
+    def linha_da_conexao(self) -> str:
+        automatico = "envio automático " + (pintar(SUCESSO, "ligado") if self.envio_automatico else "desligado")
+        if self.porta:
+            situacao = pintar(SUCESSO, "● ") + f"{self.porta.caminho} conectado"
+            if self.sincronizacao_pendente:
+                situacao += pintar(APAGADO, " · esperando o robô iniciar")
+        elif self.conexao_pausada_pelo_usuario:
+            situacao = pintar(APAGADO, "○ porta liberada (c conecta)")
+        else:
+            onde = self.porta_escolhida_na_linha_de_comando or ", ".join(PADROES_DE_PORTA)
+            situacao = pintar(ERRO, "○ ") + f"procurando o robô em {onde}"
+        return f" {situacao}   {pintar(APAGADO, '·')}   {automatico}"
+
+    def linha_do_parametro(self, indice: int, parametro: Parametro, agora: float) -> str:
+        selecionado = indice == self.indice_selecionado
+        valor = self.valores_na_interface[parametro.nome]
+
+        marcador = pintar(TITULO, "▶") if selecionado else " "
+        nome = parametro.nome.ljust(18)
+        nome = pintar(NEGRITO, nome) if selecionado else nome
+
+        fracao = (valor - parametro.inicio_da_barra) / (parametro.fim_da_barra - parametro.inicio_da_barra)
+        barra = barra_com_marcador(fracao) if parametro.centrado else barra_cheia(fracao)
+
+        if selecionado and self.texto_em_edicao is not None:
+            texto_do_valor = pintar(INVERTIDO, (self.texto_em_edicao + "▏").rjust(10))
+        else:
+            texto_do_valor = formatar(parametro, valor).rjust(10)
+
+        return f" {marcador} {nome} {barra} {texto_do_valor}   {self.situacao_do_parametro(parametro, agora)}"
+
+    def situacao_do_parametro(self, parametro: Parametro, agora: float) -> str:
+        nome = parametro.nome
+        if not valores_iguais(parametro, self.valores_na_interface[nome], self.valores_enviados[nome]):
+            if nome in self.envio_automatico_agendado_para:
+                return pintar(APAGADO, "… enviando")
+            return pintar(AVISO, "● não enviado (Enter)")
+        if nome not in self.valores_no_robo:
+            if self.porta and self.robo_informou_ajustes:
+                return pintar(AVISO, "✗ o sketch do robô não tem este ajuste")
+            return pintar(APAGADO, "✓ enviado · sem resposta do robô" if self.porta else "✓ guardado")
+        if valores_iguais(parametro, self.valores_no_robo[nome], self.valores_enviados[nome]):
+            return pintar(SUCESSO, "✓ no robô")
+        if agora - self.momento_do_envio.get(nome, 0.0) < SEGUNDOS_AGUARDANDO_CONFIRMACAO or self.fila_de_comandos:
+            return pintar(APAGADO, "… enviando")
+        return pintar(AVISO, f"robô está com {formatar(parametro, self.valores_no_robo[nome])}")
+
+    def linhas_do_robo(self, agora: float) -> list[str]:
+        if self.robo_equilibrando is None:
+            estado = pintar(APAGADO, "estado desconhecido")
+        elif self.robo_equilibrando:
+            estado = pintar(SUCESSO, "● equilibrando")
+        else:
+            estado = pintar(AVISO, "○ caído, esperando ficar em pé")
+
+        if self.telemetria_ligada is None:
+            telemetria = pintar(APAGADO, "telemetria ?")
+        else:
+            telemetria = "telemetria " + ("ligada" if self.telemetria_ligada else pintar(AVISO, "desligada"))
+
+        cabecalho = f" {pintar(NEGRITO, 'Robô')}   {estado}   {pintar(APAGADO, '·')}   {telemetria}"
+
+        recente = self.porta is not None and agora - self.momento_da_ultima_telemetria < SEGUNDOS_ATE_A_TELEMETRIA_FICAR_VELHA
+        if not recente:
+            vazia = pintar(APAGADO, "[" + "·" * LARGURA_DA_BARRA + "]")
+            return [
+                cabecalho,
+                f"   {'ângulo'.ljust(16)} {vazia} {'—'.rjust(10)}",
+                f"   {'comando motor'.ljust(16)} {vazia} {'—'.rjust(10)}",
+                pintar(APAGADO, "   sem telemetria recente" + ("" if self.porta else " (robô desconectado)")),
+            ]
+
+        angulo = self.telemetria.get("angulo", 0.0)
+        alvo = self.telemetria.get("angulo_equilibrio", 0.0)
+        comando = self.telemetria.get("comando_motor", 0.0)
+        # A barra vai de −queda a +queda: as pontas são onde o robô desiste.
+        if "angulo_queda" in self.valores_no_robo:
+            queda = self.valores_no_robo["angulo_queda"]
+        elif self.robo_informou_ajustes:
+            queda = PARAMETRO_POR_NOME["angulo_queda"].valor_padrao_do_sketch   # sketch antigo: fixo em 35°
+        else:
+            queda = self.valores_enviados["angulo_queda"]
+        fracao_do_angulo = (angulo + queda) / (2 * queda)
+        fracao_do_alvo = (alvo + queda) / (2 * queda)
+
+        termos = "   ".join(f"{letra} {self.telemetria.get('termo_' + letra, 0.0):+7.1f}" for letra in "PID")
+        return [
+            cabecalho,
+            f"   {'ângulo'.ljust(16)} {barra_com_marcador(fracao_do_angulo, fracao_do_alvo)} {f'{angulo:+.2f}°'.rjust(10)}"
+            + pintar(APAGADO, f"   ±{queda:.0f}°"),
+            f"   {'comando motor'.ljust(16)} {barra_a_partir_do_centro(comando / 255)} {f'{comando:+.0f}'.rjust(10)}"
+            + pintar(APAGADO, "   ±255"),
+            f"   {'termos do PID'.ljust(16)} {termos}",
+        ]
+
+    def linhas_das_mensagens(self) -> list[str]:
+        linhas = []
+        for hora, cor, texto in self.mensagens:
+            linhas.append(f"   {pintar(APAGADO, hora)}  {pintar(cor, texto) if cor else texto}")
+        # Sempre o mesmo número de linhas, para o rodapé não pular.
+        return linhas + [""] * (self.mensagens.maxlen - len(linhas))
+
+    def linhas_do_rodape(self) -> list[str]:
+        def atalho(teclas: str, acao: str) -> str:
+            return f"{teclas} {pintar(APAGADO, acao)}"
+
+        separador = pintar(APAGADO, "  •  ")
+        return [
+            " " + separador.join([atalho("↑/↓", "escolhe"), atalho("←/→", "ajusta"),
+                                  atalho("PgUp/PgDn", "ajusta ×10"), atalho("0–9", "digita um valor")]),
+            " " + separador.join([atalho("Enter", "envia"), atalho("e", "envia todos"),
+                                  atalho("u", "volta ao último envio"), atalho("a", "envio automático")]),
+            " " + separador.join([atalho("m", "marca o ângulo atual como equilíbrio"), atalho("t", "telemetria"),
+                                  atalho("c", "conecta/libera a porta"), atalho("q", "sai")]),
+        ]
+
+    # -------------------------------------------------------------------------
+    #  Laço principal
+    # -------------------------------------------------------------------------
+
+    def executar(self) -> None:
+        entrada = sys.stdin.fileno()
+        estado_do_terminal = termios.tcgetattr(entrada)
+        signal.signal(signal.SIGWINCH, lambda *_: self.pedir_tela_limpa())
+
+        # Tela alternativa (não suja o histórico do terminal) e cursor escondido.
+        os.write(sys.stdout.fileno(), b"\033[?1049h\033[?25l")
+        tty.setcbreak(entrada)
+        try:
+            while self.rodando:
+                self.um_ciclo(entrada)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            termios.tcsetattr(entrada, termios.TCSADRAIN, estado_do_terminal)
+            os.write(sys.stdout.fileno(), b"\033[?25h\033[?1049l")
+            if self.porta:
+                self.porta.fechar()
+        self.imprimir_resumo()
+
+    def pedir_tela_limpa(self) -> None:
+        self.precisa_limpar_a_tela = True
+        self.precisa_redesenhar = True
+
+    def um_ciclo(self, entrada: int) -> None:
+        agora = time.monotonic()
+        self.tentar_conectar(agora)
+
+        descritores = [entrada] + ([self.porta.descritor] if self.porta else [])
+        try:
+            prontos, _, _ = select.select(descritores, [], [], 0.05)
+        except InterruptedError:                          # SIGWINCH durante o select
+            prontos = []
+
+        if entrada in prontos:
+            for tecla in separar_teclas(os.read(entrada, 1024).decode("utf-8", "ignore")):
+                self.tratar_tecla(tecla)
+            self.precisa_redesenhar = True
+
+        if self.porta and self.porta.descritor in prontos:
+            try:
+                for linha in self.porta.ler_linhas_completas():
+                    self.tratar_linha_do_robo(linha, agora)
+            except OSError:
+                self.desconectar("o robô foi desconectado")
+            self.precisa_redesenhar = True
+
+        self.pedir_valores_se_preciso(agora)
+        self.despachar_envios_automaticos(agora)
+        self.despachar_fila_de_comandos(agora)
+
+        if self.precisa_redesenhar:
+            self.desenhar()
+
+    def imprimir_resumo(self) -> None:
+        print(pintar(TITULO, "Últimos valores enviados") + pintar(APAGADO, f"  (guardados em {ARQUIVO_DO_ULTIMO_ENVIO})"))
+        print(pintar(APAGADO, "Para deixar fixo no robô, copie para o início do robo_equilibrista.ino:"))
+        for parametro in PARAMETROS:
+            print(f"  {VARIAVEL_NO_SKETCH[parametro.nome]} = {formatar(parametro, self.valores_enviados[parametro.nome])};")
+        nao_enviados = [p.nome for p in PARAMETROS
+                        if not valores_iguais(p, self.valores_na_interface[p.nome], self.valores_enviados[p.nome])]
+        if nao_enviados:
+            print(pintar(AVISO, "Aviso: ") + f"alterações não enviadas foram descartadas: {', '.join(nao_enviados)}")
+
+
+# =============================================================================
+#  Barras e teclas
+# =============================================================================
+
+def barra_cheia(fracao: float) -> str:
+    cheias = round(limitar(fracao, 0.0, 1.0) * LARGURA_DA_BARRA)
+    return "[" + pintar(SUCESSO, "█" * cheias) + pintar(APAGADO, "░" * (LARGURA_DA_BARRA - cheias)) + "]"
+
+
+def barra_com_marcador(fracao: float, fracao_da_referencia: float = 0.5) -> str:
+    """Linha com uma referência (┼) e um marcador (●). Usada para ângulos."""
+    posicao = round(limitar(fracao, 0.0, 1.0) * (LARGURA_DA_BARRA - 1))
+    referencia = round(limitar(fracao_da_referencia, 0.0, 1.0) * (LARGURA_DA_BARRA - 1))
+    celulas = []
+    for indice in range(LARGURA_DA_BARRA):
+        if indice == posicao:
+            celulas.append(pintar(SUCESSO, "●"))
+        elif indice == referencia:
+            celulas.append("┼")
+        else:
+            celulas.append(pintar(APAGADO, "─"))
+    return "[" + "".join(celulas) + "]"
+
+
+def barra_a_partir_do_centro(fracao: float) -> str:
+    """Enche do centro para a esquerda (negativo) ou para a direita (positivo)."""
+    centro = LARGURA_DA_BARRA // 2
+    ponta = centro + round(limitar(fracao, -1.0, 1.0) * centro)
+    inicio, fim = sorted((centro, ponta))
+    celulas = []
+    for indice in range(LARGURA_DA_BARRA):
+        if indice == centro and inicio == fim:
+            celulas.append("┼")
+        elif inicio <= indice <= fim:
+            celulas.append(pintar(SUCESSO, "█"))
+        else:
+            celulas.append(pintar(APAGADO, "░"))
+    return "[" + "".join(celulas) + "]"
+
+
+SEQUENCIAS_DE_ESCAPE = {
+    "[A": "CIMA", "OA": "CIMA",
+    "[B": "BAIXO", "OB": "BAIXO",
+    "[C": "DIREITA", "OC": "DIREITA",
+    "[D": "ESQUERDA", "OD": "ESQUERDA",
+    "[5~": "PGUP", "[6~": "PGDN",
+}
+
+
+def separar_teclas(texto: str) -> list[str]:
+    """Transforma o que chegou do teclado numa lista de teclas ('a', 'CIMA', 'ESC'...)."""
+    teclas = []
+    indice = 0
+    while indice < len(texto):
+        if texto[indice] != "\033":
+            teclas.append(texto[indice])
+            indice += 1
+            continue
+        sequencia = re.match(r"\033(\[[0-9;]*[A-Za-z~]|O[A-Za-z])", texto[indice:])
+        if sequencia:
+            teclas.append(SEQUENCIAS_DE_ESCAPE.get(sequencia.group(1), "DESCONHECIDA"))
+            indice += len(sequencia.group(0))
+        else:
+            teclas.append("ESC")
+            indice += 1
+    return teclas
+
+
+# =============================================================================
+#  Linha de comando
+# =============================================================================
+
+def mostrar_uso() -> None:
+    nome = os.path.basename(sys.argv[0])
+    print(f"Uso: {nome} [--porta DISPOSITIVO]\n")
+    print("Abre uma interface para ajustar ao vivo o PID do robô equilibrista pela USB.")
+    print("Os valores enviados ficam guardados e voltam na próxima vez que o programa abrir;")
+    print("ao conectar, o último envio é reaplicado no robô (o Nano reinicia ao abrir a porta).\n")
+    print("  --porta DISPOSITIVO   usa esta porta, ex.: /dev/ttyUSB0 (padrão: a última usada ou a primeira encontrada)")
+    print("  --help, -h            mostra esta ajuda\n")
+    print(f"Último envio guardado em: {ARQUIVO_DO_ULTIMO_ENVIO}")
+
+
+def erro_de_uso(texto: str) -> None:
+    print(pintar(ERRO, "Erro: ") + texto, file=sys.stderr)
+    sys.exit(2)
+
+
+def principal() -> None:
+    argumentos = sys.argv[1:]
+    porta = None
+    while argumentos:
+        argumento = argumentos.pop(0)
+        if argumento in ("--help", "-h"):
+            mostrar_uso()
+            return
+        if argumento == "--porta":
+            if not argumentos:
+                erro_de_uso("--porta precisa de um dispositivo, ex.: --porta /dev/ttyUSB0")
+            porta = argumentos.pop(0)
+        elif argumento.startswith("--porta="):
+            porta = argumento.split("=", 1)[1]
+        else:
+            erro_de_uso(f"argumento desconhecido: '{argumento}'. Consulte {os.path.basename(sys.argv[0])} --help.")
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        erro_de_uso("a interface precisa ser executada em um terminal.")
+
+    AjusteDoPid(porta).executar()
+
+
+if __name__ == "__main__":
+    principal()

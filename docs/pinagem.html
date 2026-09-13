@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Exportado de https://claude.ai/code/artifact/c9c3ca1e-51b2-4fb4-a12d-735298f4e193 -->
+<title>Pinagem do Robô Equilibrista</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground: #ECEFEA;
+    --sheet: #F7F8F5;
+    --ink: #17201B;
+    --muted: #5A6860;
+    --rule: #C7D0C9;
+    --grid: #DDE3DE;
+
+    --w-vin: #D1342B;
+    --w-5v: #E07A1F;
+    --w-gnd: #1F2622;
+    --w-sda: #2E8B57;
+    --w-scl: #C99700;
+    --w-in1: #8656C8;
+    --w-in2: #2493A6;
+    --w-motor: #8A6E55;
+    --w-int: #C23A84;
+
+    --pcb-nano: #1C5A96;
+    --pcb-driver: #A5302B;
+    --pcb-mpu: #3F3C94;
+    --silk: #F3F0E4;
+    --pad: #D2A445;
+    --metal: #B6BDBF;
+
+    --display: "Chakra Petch", "Bahnschrift", "Arial Narrow", sans-serif;
+    --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #111613;
+      --sheet: #171D19;
+      --ink: #E2E8E3;
+      --muted: #95A39A;
+      --rule: #2C3630;
+      --grid: #212A25;
+      --w-vin: #F0584E;
+      --w-5v: #F29A45;
+      --w-gnd: #AEB9B2;
+      --w-sda: #4DBA7E;
+      --w-scl: #E8B92A;
+      --w-in1: #A987EC;
+      --w-in2: #43BBCF;
+      --w-motor: #B39377;
+      --w-int: #EC7DB9;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #111613;
+    --sheet: #171D19;
+    --ink: #E2E8E3;
+    --muted: #95A39A;
+    --rule: #2C3630;
+    --grid: #212A25;
+    --w-vin: #F0584E;
+    --w-5v: #F29A45;
+    --w-gnd: #AEB9B2;
+    --w-sda: #4DBA7E;
+    --w-scl: #E8B92A;
+    --w-in1: #A987EC;
+    --w-in2: #43BBCF;
+    --w-motor: #B39377;
+    --w-int: #EC7DB9;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 15px;
+    line-height: 1.55;
+    padding-inline: 20px;
+    padding-block: 32px 56px;
+  }
+  .page { max-width: 1120px; margin-inline: auto; display: grid; gap: 28px; }
+
+  /* Title block, like the corner of a drawing sheet */
+  header {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 12px 32px;
+    align-items: end;
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 14px;
+  }
+  h1 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: clamp(28px, 4.2vw, 42px);
+    line-height: 1.05;
+    letter-spacing: 0.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .lead { margin: 8px 0 0; color: var(--muted); max-width: 64ch; }
+  .lead code { color: var(--ink); }
+  .meta {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 2px 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .meta dt { margin: 0; }
+  .meta dd { margin: 0; color: var(--ink); text-align: right; }
+  @media (max-width: 640px) {
+    header { grid-template-columns: 1fr; }
+    .meta dd { text-align: left; }
+  }
+
+  code { font-family: var(--mono); font-size: 0.9em; }
+
+  /* The sheet holding the drawing */
+  figure { margin: 0; }
+  .sheet {
+    background: var(--sheet);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+  }
+  .scroll { overflow-x: auto; }
+  .scroll svg { display: block; width: 100%; min-width: 760px; height: auto; }
+  figcaption {
+    font-size: 13px;
+    color: var(--muted);
+    padding: 10px 16px 12px;
+    border-top: 1px solid var(--rule);
+  }
+
+  .legend {
+    list-style: none;
+    margin: 0;
+    padding: 12px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 20px;
+    font-family: var(--mono);
+    font-size: 12px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .legend li { display: flex; align-items: center; gap: 8px; }
+  .swatch { width: 22px; height: 4px; border-radius: 2px; display: inline-block; flex: none; }
+
+  /* SVG styling */
+  .bggrid { stroke: var(--grid); stroke-width: 1; }
+  .wire { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+  .vin { stroke: var(--w-vin); }
+  .v5 { stroke: var(--w-5v); }
+  .gnd { stroke: var(--w-gnd); }
+  .sda { stroke: var(--w-sda); }
+  .scl { stroke: var(--w-scl); }
+  .in1 { stroke: var(--w-in1); }
+  .in2 { stroke: var(--w-in2); }
+  .mot { stroke: var(--w-motor); }
+  .int { stroke: var(--w-int); }
+  .dot { stroke: none; }
+  .dot.gnd { fill: var(--w-gnd); }
+  .dot.vin { fill: var(--w-vin); }
+  .board-name { font-family: var(--display); font-weight: 600; fill: var(--silk); letter-spacing: 0.04em; }
+  .silk { font-family: var(--mono); font-size: 9.5px; fill: var(--silk); }
+  .silk.used { font-weight: 600; }
+  .silk.idle { opacity: 0.5; }
+  .pad { fill: var(--pad); }
+  .hole { fill: #1a1a1a; }
+  .pad.idle { opacity: 0.45; }
+  .note { font-family: var(--mono); font-size: 11px; fill: var(--muted); }
+  .label { font-family: var(--body); font-size: 12px; font-weight: 500; fill: var(--ink); }
+  .part { fill: var(--sheet); stroke: var(--ink); stroke-width: 1.5; }
+  .inkline { stroke: var(--ink); fill: none; }
+  .inkfill { fill: var(--ink); }
+  .wheel { fill: var(--ink); }
+  .motor-body { fill: var(--metal); stroke: var(--ink); stroke-width: 1.5; }
+  .ref { stroke: var(--muted); stroke-dasharray: 4 4; fill: none; }
+
+  /* Lower section */
+  .lower {
+    display: grid;
+    grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+    gap: 28px;
+    align-items: start;
+  }
+  @media (max-width: 860px) { .lower { grid-template-columns: 1fr; } }
+
+  h2 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 20px;
+    letter-spacing: 0.02em;
+    margin: 0 0 10px;
+  }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    border-bottom: 2px solid var(--ink);
+  }
+  tbody th[colspan] {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    padding-top: 16px;
+  }
+  td.pin { font-family: var(--mono); font-weight: 600; white-space: nowrap; }
+  td.pin .swatch { margin-right: 8px; vertical-align: middle; }
+  td.why { color: var(--muted); }
+
+  aside { display: grid; gap: 28px; }
+  .rules { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+  .rules li { padding-left: 16px; position: relative; max-width: 60ch; }
+  .rules li::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 0.62em;
+    width: 7px; height: 7px;
+    border: 1.5px solid var(--ink);
+    transform: rotate(45deg);
+  }
+  .rules strong { font-weight: 600; }
+
+  .side .sheet svg { display: block; width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <div>
+      <h1>Pinagem do Robô Equilibrista</h1>
+      <p class="lead">Arduino Nano, sensor MPU6050 e driver MX1508 comandando um único motor que move as duas rodas. Os pinos batem com as constantes do sketch <code>robo_equilibrista.ino</code>.</p>
+    </div>
+    <dl class="meta">
+      <dt>Folha</dt><dd>1 / 1</dd>
+      <dt>Revisão</dt><dd>B</dd>
+      <dt>Alimentação</dt><dd>2S · 7,4 V</dd>
+      <dt>Data</dt><dd>13/09/2026</dd>
+    </dl>
+  </header>
+
+  <figure class="sheet">
+    <ul class="legend" aria-label="Legenda das cores dos fios">
+      <li><span class="swatch" style="background:var(--w-vin)"></span>7,4 V bateria</li>
+      <li><span class="swatch" style="background:var(--w-gnd)"></span>GND comum</li>
+      <li><span class="swatch" style="background:var(--w-5v)"></span>5 V</li>
+      <li><span class="swatch" style="background:var(--w-sda)"></span>I²C SDA</li>
+      <li><span class="swatch" style="background:var(--w-scl)"></span>I²C SCL</li>
+      <li><span class="swatch" style="background:var(--w-int)"></span>INT interrupção</li>
+      <li><span class="swatch" style="background:var(--w-in1)"></span>PWM IN1</li>
+      <li><span class="swatch" style="background:var(--w-in2)"></span>PWM IN2</li>
+      <li><span class="swatch" style="background:var(--w-motor)"></span>motor</li>
+    </ul>
+    <div class="scroll">
+      <svg viewBox="0 0 1000 850" role="img" aria-label="Diagrama de ligação: Nano D9 e D10 vão para IN1 e IN2 do MX1508, cuja saída MOTOR-A liga o motor; A4 e A5 vão para SDA e SCL do MPU6050, cujo pino INT vai para D2 do Nano; o sensor é alimentado por 5V e GND do Nano; a bateria de 7,4 V passa por uma chave e alimenta o MX1508 e o VIN do Nano, com terra comum.">
+        <defs>
+          <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+            <path d="M28 0H0V28" class="bggrid" fill="none"/>
+          </pattern>
+        </defs>
+        <rect x="0" y="0" width="1000" height="850" fill="url(#grid)"/>
+
+        <!-- ============ MOTOR (vista de cima) ============ -->
+        <line x1="110" y1="40" x2="110" y2="220" class="inkline" stroke-width="5"/>
+        <rect x="66" y="20" width="88" height="22" rx="5" class="wheel"/>
+        <rect x="66" y="218" width="88" height="22" rx="5" class="wheel"/>
+        <circle cx="110" cy="130" r="34" class="motor-body"/>
+        <text x="110" y="137" text-anchor="middle" class="label" style="font-size:20px;font-weight:600;fill:#17201B">M</text>
+        <text x="110" y="266" text-anchor="middle" class="label">Motor + 2 rodas</text>
+        <text x="110" y="282" text-anchor="middle" class="note">eixo único, vista de cima</text>
+
+        <!-- motor wires -->
+        <path d="M142 118 H220" class="wire mot"/>
+        <path d="M142 142 H220" class="wire mot"/>
+
+        <!-- ============ MX1508 ============ -->
+        <rect x="220" y="64" width="200" height="132" rx="6" fill="var(--pcb-driver)"/>
+        <text x="320" y="134" text-anchor="middle" class="board-name" style="font-size:19px">MX1508</text>
+        <text x="320" y="150" text-anchor="middle" class="silk idle">ponte H dupla</text>
+        <!-- MOTOR-A pads (left) -->
+        <text x="232" y="104" class="silk used">MOTOR-A</text>
+        <circle cx="220" cy="118" r="5" class="pad"/><circle cx="220" cy="118" r="2" class="hole"/>
+        <circle cx="220" cy="142" r="5" class="pad"/><circle cx="220" cy="142" r="2" class="hole"/>
+        <!-- MOTOR-B pads (top, unused) -->
+        <circle cx="300" cy="64" r="5" class="pad idle"/><circle cx="330" cy="64" r="5" class="pad idle"/>
+        <text x="315" y="84" text-anchor="middle" class="silk idle">MOTOR-B livre</text>
+        <!-- input header (right) -->
+        <circle cx="420" cy="92" r="5" class="pad"/><circle cx="420" cy="92" r="2" class="hole"/>
+        <circle cx="420" cy="116" r="5" class="pad"/><circle cx="420" cy="116" r="2" class="hole"/>
+        <circle cx="420" cy="140" r="5" class="pad idle"/>
+        <circle cx="420" cy="164" r="5" class="pad idle"/>
+        <text x="406" y="95" text-anchor="end" class="silk used">IN1</text>
+        <text x="406" y="119" text-anchor="end" class="silk used">IN2</text>
+        <text x="406" y="143" text-anchor="end" class="silk idle">IN3</text>
+        <text x="406" y="167" text-anchor="end" class="silk idle">IN4</text>
+        <!-- power pins (bottom) -->
+        <circle cx="270" cy="196" r="5" class="pad"/><circle cx="270" cy="196" r="2" class="hole"/>
+        <circle cx="320" cy="196" r="5" class="pad"/><circle cx="320" cy="196" r="2" class="hole"/>
+        <text x="270" y="184" text-anchor="middle" class="silk used" style="font-size:12px">+</text>
+        <text x="320" y="184" text-anchor="middle" class="silk used" style="font-size:12px">−</text>
+
+        <!-- PWM wires: Nano D9 -> IN1, D10 -> IN2 -->
+        <path d="M604 296 V92 H420" class="wire in1"/>
+        <path d="M576 296 V116 H420" class="wire in2"/>
+        <text x="470" y="84" class="note">D9 · PWM frente</text>
+        <text x="470" y="108" class="note">D10 · PWM ré</text>
+
+        <!-- INT: MPU6050 INT -> Nano D2, around the left of the Nano, hopping over D10 and D9 -->
+        <path d="M604 556 V530 H448 V250 H570 A6 6 0 0 1 582 250 H598 A6 6 0 0 1 610 250 H800 V296" class="wire int"/>
+        <text x="458" y="522" class="note">INT → D2 · interrupção</text>
+
+        <!-- capacitor across driver supply -->
+        <path d="M270 240 H290" class="wire vin"/>
+        <path d="M300 240 H320" class="wire gnd"/>
+        <line x1="291" y1="230" x2="291" y2="250" class="inkline" stroke-width="2.5"/>
+        <path d="M299 230 Q295 240 299 250" class="inkline" stroke-width="2.5"/>
+        <text x="282" y="229" text-anchor="middle" class="note" style="font-size:10px">+</text>
+        <text x="295" y="270" text-anchor="middle" class="note">100 µF</text>
+        <circle cx="270" cy="240" r="4" class="dot vin"/>
+        <circle cx="320" cy="240" r="4" class="dot gnd"/>
+
+        <!-- ============ ARDUINO NANO ============ -->
+        <rect x="470" y="330" width="36" height="50" rx="3" fill="var(--metal)" stroke="var(--ink)" stroke-width="1"/>
+        <text x="440" y="360" text-anchor="end" class="note">USB</text>
+        <rect x="496" y="280" width="440" height="150" rx="6" fill="var(--pcb-nano)"/>
+        <text x="716" y="356" text-anchor="middle" class="board-name" style="font-size:20px">ARDUINO NANO</text>
+        <text x="716" y="374" text-anchor="middle" class="silk idle">ATmega328P · 16 MHz</text>
+
+        <!-- top row: D12 .. TX1 -->
+        <g>
+          <circle cx="520" cy="296" r="5" class="pad idle"/>
+          <circle cx="548" cy="296" r="5" class="pad idle"/>
+          <circle cx="576" cy="296" r="5" class="pad"/><circle cx="576" cy="296" r="2" class="hole"/>
+          <circle cx="604" cy="296" r="5" class="pad"/><circle cx="604" cy="296" r="2" class="hole"/>
+          <circle cx="632" cy="296" r="5" class="pad idle"/>
+          <circle cx="660" cy="296" r="5" class="pad idle"/>
+          <circle cx="688" cy="296" r="5" class="pad idle"/>
+          <circle cx="716" cy="296" r="5" class="pad idle"/>
+          <circle cx="744" cy="296" r="5" class="pad idle"/>
+          <circle cx="772" cy="296" r="5" class="pad idle"/>
+          <circle cx="800" cy="296" r="5" class="pad"/><circle cx="800" cy="296" r="2" class="hole"/>
+          <circle cx="828" cy="296" r="5" class="pad idle"/>
+          <circle cx="856" cy="296" r="5" class="pad idle"/>
+          <circle cx="884" cy="296" r="5" class="pad idle"/>
+          <circle cx="912" cy="296" r="5" class="pad idle"/>
+        </g>
+        <g text-anchor="middle">
+          <text x="520" y="318" class="silk idle">D12</text>
+          <text x="548" y="318" class="silk idle">~D11</text>
+          <text x="576" y="318" class="silk used">~D10</text>
+          <text x="604" y="318" class="silk used">~D9</text>
+          <text x="632" y="318" class="silk idle">D8</text>
+          <text x="660" y="318" class="silk idle">D7</text>
+          <text x="688" y="318" class="silk idle">~D6</text>
+          <text x="716" y="318" class="silk idle">~D5</text>
+          <text x="744" y="318" class="silk idle">D4</text>
+          <text x="772" y="318" class="silk idle">~D3</text>
+          <text x="800" y="318" class="silk used">D2</text>
+          <text x="828" y="318" class="silk idle">GND</text>
+          <text x="856" y="318" class="silk idle">RST</text>
+          <text x="884" y="318" class="silk idle">RX0</text>
+          <text x="912" y="318" class="silk idle">TX1</text>
+        </g>
+
+        <!-- bottom row: D13 .. VIN -->
+        <g>
+          <circle cx="520" cy="414" r="5" class="pad idle"/>
+          <circle cx="548" cy="414" r="5" class="pad idle"/>
+          <circle cx="576" cy="414" r="5" class="pad idle"/>
+          <circle cx="604" cy="414" r="5" class="pad idle"/>
+          <circle cx="632" cy="414" r="5" class="pad idle"/>
+          <circle cx="660" cy="414" r="5" class="pad idle"/>
+          <circle cx="688" cy="414" r="5" class="pad idle"/>
+          <circle cx="716" cy="414" r="5" class="pad"/><circle cx="716" cy="414" r="2" class="hole"/>
+          <circle cx="744" cy="414" r="5" class="pad"/><circle cx="744" cy="414" r="2" class="hole"/>
+          <circle cx="772" cy="414" r="5" class="pad idle"/>
+          <circle cx="800" cy="414" r="5" class="pad idle"/>
+          <circle cx="828" cy="414" r="5" class="pad"/><circle cx="828" cy="414" r="2" class="hole"/>
+          <circle cx="856" cy="414" r="5" class="pad idle"/>
+          <circle cx="884" cy="414" r="5" class="pad"/><circle cx="884" cy="414" r="2" class="hole"/>
+          <circle cx="912" cy="414" r="5" class="pad"/><circle cx="912" cy="414" r="2" class="hole"/>
+        </g>
+        <g text-anchor="middle">
+          <text x="520" y="400" class="silk idle">D13</text>
+          <text x="548" y="400" class="silk idle">3V3</text>
+          <text x="576" y="400" class="silk idle">REF</text>
+          <text x="604" y="400" class="silk idle">A0</text>
+          <text x="632" y="400" class="silk idle">A1</text>
+          <text x="660" y="400" class="silk idle">A2</text>
+          <text x="688" y="400" class="silk idle">A3</text>
+          <text x="716" y="400" class="silk used">A4</text>
+          <text x="744" y="400" class="silk used">A5</text>
+          <text x="772" y="400" class="silk idle">A6</text>
+          <text x="800" y="400" class="silk idle">A7</text>
+          <text x="828" y="400" class="silk used">5V</text>
+          <text x="856" y="400" class="silk idle">RST</text>
+          <text x="884" y="400" class="silk used">GND</text>
+          <text x="912" y="400" class="silk used">VIN</text>
+        </g>
+
+        <!-- ============ I2C + 5V to MPU6050 ============ -->
+        <path d="M716 414 V556" class="wire sda"/>
+        <path d="M744 414 V556" class="wire scl"/>
+        <path d="M828 414 V470 H800 V556" class="wire v5"/>
+        <!-- GND branch hops over the 5 V wire -->
+        <path d="M884 490 H806 A6 6 0 0 0 794 490 H772 V556" class="wire gnd"/>
+        <circle cx="884" cy="490" r="4" class="dot gnd"/>
+        <text x="704" y="500" text-anchor="end" class="note">I²C · A4 SDA · A5 SCL</text>
+        <text x="836" y="524" class="note">5 V</text>
+
+        <!-- ============ MPU6050 / GY-521 ============ -->
+        <rect x="584" y="540" width="236" height="120" rx="6" fill="var(--pcb-mpu)"/>
+        <g>
+          <circle cx="604" cy="556" r="5" class="pad"/><circle cx="604" cy="556" r="2" class="hole"/>
+          <circle cx="632" cy="556" r="5" class="pad idle"/>
+          <circle cx="660" cy="556" r="5" class="pad idle"/>
+          <circle cx="688" cy="556" r="5" class="pad idle"/>
+          <circle cx="716" cy="556" r="5" class="pad"/><circle cx="716" cy="556" r="2" class="hole"/>
+          <circle cx="744" cy="556" r="5" class="pad"/><circle cx="744" cy="556" r="2" class="hole"/>
+          <circle cx="772" cy="556" r="5" class="pad"/><circle cx="772" cy="556" r="2" class="hole"/>
+          <circle cx="800" cy="556" r="5" class="pad"/><circle cx="800" cy="556" r="2" class="hole"/>
+        </g>
+        <g text-anchor="middle">
+          <text x="604" y="578" class="silk used">INT</text>
+          <text x="632" y="578" class="silk idle">AD0</text>
+          <text x="660" y="578" class="silk idle">XCL</text>
+          <text x="688" y="578" class="silk idle">XDA</text>
+          <text x="716" y="578" class="silk used">SDA</text>
+          <text x="744" y="578" class="silk used">SCL</text>
+          <text x="772" y="578" class="silk used">GND</text>
+          <text x="800" y="578" class="silk used">VCC</text>
+        </g>
+        <text x="702" y="620" text-anchor="middle" class="board-name" style="font-size:17px">MPU6050</text>
+        <text x="702" y="637" text-anchor="middle" class="silk idle">GY-521 · endereço 0x68</text>
+
+        <!-- ============ POWER ============ -->
+        <!-- driver supply down to the rails -->
+        <path d="M270 196 V810" class="wire vin"/>
+        <path d="M320 196 V690" class="wire gnd"/>
+        <!-- Nano GND and VIN down to the rails -->
+        <path d="M884 414 V690" class="wire gnd"/>
+        <path d="M912 414 V810" class="wire vin"/>
+        <!-- rails -->
+        <path d="M320 690 H884" class="wire gnd"/>
+        <path d="M270 810 H912" class="wire vin"/>
+        <text x="560" y="682" class="note">GND comum · bateria −, MX1508 −, Nano GND</text>
+        <text x="560" y="802" class="note">7,4 V · MX1508 + e Nano VIN</text>
+
+        <!-- battery between the rails -->
+        <path d="M460 690 V712" class="wire gnd"/>
+        <rect x="436" y="712" width="48" height="40" rx="4" class="part"/>
+        <text x="460" y="728" text-anchor="middle" class="label" style="font-size:12px">−</text>
+        <text x="460" y="746" text-anchor="middle" class="label" style="font-size:12px">+</text>
+        <path d="M460 752 V764" class="wire vin"/>
+        <circle cx="460" cy="767" r="3" class="part"/>
+        <line x1="461" y1="769" x2="476" y2="790" class="inkline" stroke-width="2.5" stroke-linecap="round"/>
+        <circle cx="460" cy="795" r="3" class="part"/>
+        <path d="M460 798 V810" class="wire vin"/>
+        <circle cx="460" cy="690" r="4" class="dot gnd"/>
+        <circle cx="460" cy="810" r="4" class="dot vin"/>
+        <text x="352" y="730" text-anchor="middle" class="label">Bateria 2S</text>
+        <text x="352" y="746" text-anchor="middle" class="note">2 × 18650</text>
+        <text x="486" y="786" class="note">chave</text>
+      </svg>
+    </div>
+    <figcaption>Posições dos módulos são esquemáticas, escolhidas para que poucos fios se cruzem: o GND do sensor salta sobre o 5 V e o INT salta sobre D10 e D9. O <code>~</code> marca os pinos do Nano com PWM. Na placa real, confira sempre o nome impresso ao lado de cada pino.</figcaption>
+  </figure>
+
+  <div class="lower">
+    <section>
+      <h2>Ligações</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th scope="col">Nano / origem</th><th scope="col">Destino</th><th scope="col">Por quê</th></tr>
+          </thead>
+          <tbody>
+            <tr><th colspan="3" scope="colgroup">Sensor MPU6050</th></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-sda)"></span>A4</td><td class="pin">SDA</td><td class="why">dados I²C; no Nano é fixo em A4</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-scl)"></span>A5</td><td class="pin">SCL</td><td class="why">relógio I²C; fixo em A5</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-5v)"></span>5V</td><td class="pin">VCC</td><td class="why">o GY-521 tem regulador de 3,3 V na placa</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-gnd)"></span>GND</td><td class="pin">GND</td><td class="why">referência do sensor</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-int)"></span>D2</td><td class="pin">INT</td><td class="why">interrupção; <code>PINO_INT_MPU</code> — um pulso a cada medição nova, 200 por segundo. No Nano só D2 e D3 servem</td></tr>
+
+            <tr><th colspan="3" scope="colgroup">Driver MX1508 e motor</th></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-in1)"></span>D9</td><td class="pin">IN1</td><td class="why">PWM; <code>PINO_MOTOR_IN1</code> — gira para a frente</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-in2)"></span>D10</td><td class="pin">IN2</td><td class="why">PWM; <code>PINO_MOTOR_IN2</code> — gira para trás</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-motor)"></span>MOTOR-A</td><td class="pin">motor</td><td class="why">os dois fios, em qualquer ordem; o sentido se acerta no código</td></tr>
+
+            <tr><th colspan="3" scope="colgroup">Alimentação</th></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-vin)"></span>Bateria +</td><td class="pin">chave → MX1508 + e Nano VIN</td><td class="why">VIN aceita 7–12 V e gera os 5 V do Nano</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-gnd)"></span>Bateria −</td><td class="pin">MX1508 − e Nano GND</td><td class="why">sem terra comum o PWM não tem referência</td></tr>
+            <tr><td class="pin"><span class="swatch" style="background:var(--w-vin)"></span>100 µF</td><td class="pin">entre + e − do MX1508</td><td class="why">segura os picos de corrente do motor</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <aside>
+      <section>
+        <h2>Antes de ligar</h2>
+        <ul class="rules">
+          <li>O MX1508 aceita <strong>no máximo 10 V</strong>. Duas células de lítio carregadas dão 8,4 V: é o limite.</li>
+          <li>Fios de A4, A5 e D2 <strong>curtos</strong> e longe dos fios do motor. Um cerâmico de 100 nF nos terminais do motor reduz o ruído.</li>
+          <li>Só com o USB e a bateria desligada, o motor fica sem força. É normal.</li>
+          <li>IN3, IN4, MOTOR-B, AD0, XCL e XDA ficam desconectados.</li>
+          <li>Sem o fio do INT o robô não liga: o LED pisca rápido e o Monitor Serial pede para conferir INT → D2.</li>
+        </ul>
+      </section>
+
+      <section class="side">
+        <h2>Montagem do sensor</h2>
+        <figure class="sheet">
+          <svg viewBox="0 0 420 280" role="img" aria-label="Vista lateral: com o robô tombando para a frente, o ângulo é positivo e as rodas devem andar para a frente.">
+            <defs>
+              <marker id="seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0 0 L10 5 L0 10 z" class="inkfill"/>
+              </marker>
+            </defs>
+            <line x1="20" y1="232" x2="400" y2="232" class="inkline" stroke-width="1.5"/>
+            <line x1="150" y1="198" x2="150" y2="30" class="ref" stroke-width="1.5"/>
+            <text x="144" y="40" text-anchor="end" class="note">vertical</text>
+
+            <g transform="rotate(14 150 198)">
+              <rect x="126" y="48" width="48" height="150" rx="4" class="part"/>
+              <rect x="130" y="124" width="40" height="8" rx="1.5" fill="var(--pcb-mpu)"/>
+              <line x1="136" y1="116" x2="166" y2="116" class="inkline" stroke-width="1.5" marker-end="url(#seta)"/>
+            </g>
+            <circle cx="150" cy="198" r="34" class="wheel"/>
+            <circle cx="150" cy="198" r="5" fill="var(--sheet)"/>
+
+            <path d="M150 88 A110 110 0 0 1 176.6 91.3" class="inkline" stroke-width="1.5"/>
+            <text x="184" y="84" class="label">ângulo &gt; 0</text>
+
+            <text x="206" y="132" class="note">MPU6050 deitado,</text>
+            <text x="206" y="146" class="note">seta X → frente</text>
+
+            <line x1="110" y1="254" x2="214" y2="254" class="inkline" stroke-width="2" marker-end="url(#seta)"/>
+            <text x="226" y="258" class="label">rodas para a frente</text>
+            <text x="400" y="222" text-anchor="end" class="note">FRENTE →</text>
+          </svg>
+          <figcaption>Tombou para a frente, o ângulo fica positivo e o PID manda as rodas para a frente, passando por baixo do robô. Se o seu fizer o contrário, use <code>INVERTER_SENTIDO_DO_ANGULO</code> ou <code>INVERTER_SENTIDO_DO_MOTOR</code>.</figcaption>
+        </figure>
+      </section>
+    </aside>
+  </div>
+</div>
+</body>
+</html>
