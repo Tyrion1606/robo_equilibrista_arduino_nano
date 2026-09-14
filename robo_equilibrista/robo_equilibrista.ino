@@ -10,8 +10,8 @@
  *   para que lado girar o motor para colocar as rodas de volta embaixo do
  *   centro de massa — do mesmo jeito que você equilibra uma vassoura na mão.
  *
- *   O QUE ACONTECE 200 VEZES POR SEGUNDO
- *   ------------------------------------
+ *   O QUE ACONTECE A CADA MEDIÇÃO (200 POR SEGUNDO, SE NÃO MUDAR O DIVISOR)
+ *   ------------------------------------------------------------------------
  *     0. O MPU6050 termina uma medição e avisa pelo pino INT (interrupção).
  *     1. Ler acelerômetro e giroscópio do MPU6050.
  *     2. Juntar as duas leituras num ângulo confiável (filtro complementar).
@@ -53,6 +53,9 @@
  *     pwm_minimo 40           muda o menor PWM que faz o motor girar
  *     angulo_queda 35         muda a inclinação a partir da qual o robô "caiu"
  *     peso_giroscopio 0.98    muda quanto o filtro confia no giroscópio (0 a 1)
+ *     divisor_amostragem 4    muda quantas medições por segundo o MPU6050 faz (1 a 19)
+ *     filtro_passa_baixas 3   muda o filtro interno do MPU6050 (1 a 6)
+ *     escala_acelerometro 2   muda a faixa do acelerômetro: ±2, ±4, ±8 ou ±16 g
  *     telemetria              liga/desliga o envio de números para o computador
  *     valores                 mostra os valores atuais
  *     ajuda                   mostra esta lista
@@ -140,15 +143,70 @@ const float ANGULO_PARA_REARMAR = 3.0;       // volta a equilibrar quando for le
 // pela serial ("peso_giroscopio 0.98"). Veja a explicação em atualizarAngulo().
 float pesoDoGiroscopio = 0.98;
 
-// Ritmo do controle: quem manda é o próprio MPU6050, que mede 200 vezes por
-// segundo e avisa cada medição nova pelo pino INT. Este é o intervalo esperado
-// entre dois avisos: 5000 µs = 5 ms. Para mudar, mude também o divisor de
-// amostragem em iniciarMPU6050().
-const unsigned long INTERVALO_ENTRE_AMOSTRAS_US = 5000;
+// Ritmo do controle: quem manda é o próprio MPU6050, que mede e avisa cada
+// medição nova pelo pino INT. Os dois ajustes abaixo vão direto para os
+// registradores do sensor e podem ser mudados pela serial.
+//
+// DIVISOR DE AMOSTRAGEM  (registrador SMPLRT_DIV, comando "divisor_amostragem")
+//   Com o filtro ligado, o sensor mede 1000 vezes por segundo por dentro. O
+//   divisor escolhe quantas dessas medições viram aviso:
+//
+//       medições por segundo = 1000 / (1 + divisor)
+//
+//      1 → 500 por segundo, a cada  2 ms
+//      4 → 200 por segundo, a cada  5 ms   ← padrão
+//      9 → 100 por segundo, a cada 10 ms
+//     19 →  50 por segundo, a cada 20 ms
+//
+//   Mais rápido: o robô reage antes, mas sobra menos tempo entre um aviso e
+//   outro para ler o sensor (~1 ms de I2C) e mandar a telemetria.
+//   Mais lento: sobra tempo, mas o PID só corrige a cada 10 ou 20 ms.
+//   Mudar o divisor também muda a velocidade do filtro complementar (veja
+//   atualizarAngulo()), porque o peso do giroscópio é aplicado a cada medição.
+//
+// FILTRO PASSA-BAIXAS  (registrador CONFIG, campo DLPF_CFG, comando "filtro_passa_baixas")
+//   Tira do sinal o que vibra rápido (motor, engrenagens), mas atrasa a leitura.
+//   Para o giroscópio, segundo o datasheet:
+//
+//      1 → corta acima de 188 Hz, atrasa  1,9 ms
+//      2 → corta acima de  98 Hz, atrasa  2,8 ms
+//      3 → corta acima de  42 Hz, atrasa  4,8 ms   ← padrão
+//      4 → corta acima de  20 Hz, atrasa  8,3 ms
+//      5 → corta acima de  10 Hz, atrasa 13,4 ms
+//      6 → corta acima de   5 Hz, atrasa 18,6 ms
+//
+//   Motor zumbindo e termo D tremendo: suba. Robô atrasado, oscilando mesmo
+//   com Kd alto: desça. O 0 (sem filtro) não é aceito: ele muda a medição
+//   interna para 8000 por segundo e a conta do divisor deixaria de valer.
+uint8_t divisorDeAmostragem = 4;
+uint8_t filtroPassaBaixas   = 3;
+const uint8_t DIVISOR_DE_AMOSTRAGEM_MINIMO = 1;    // limites aceitos pelos comandos
+const uint8_t DIVISOR_DE_AMOSTRAGEM_MAXIMO = 19;
+const uint8_t FILTRO_PASSA_BAIXAS_MINIMO   = 1;
+const uint8_t FILTRO_PASSA_BAIXAS_MAXIMO   = 6;
 
-// Passou este tempo sem nenhum aviso: o fio do INT soltou ou o sensor travou.
-// O motor é desligado. 50 ms = 10 avisos perdidos seguidos.
-const unsigned long TEMPO_MAXIMO_SEM_AVISO_US = 50000;
+// ESCALA DO ACELERÔMETRO  (registrador ACCEL_CONFIG, campo AFS_SEL, comando "escala_acelerometro")
+//   Até quantos g o acelerômetro mede. A leitura é sempre um número de 16 bits
+//   (−32768 a +32767); a escala diz a quanto o máximo corresponde:
+//
+//      ±2 g → 16384 unidades por g   ← padrão
+//      ±4 g →  8192 unidades por g
+//      ±8 g →  4096 unidades por g
+//     ±16 g →  2048 unidades por g
+//
+//   O ângulo pelo acelerômetro usa só a proporção entre os eixos (atan2), então
+//   nenhuma conta muda com a escala. Ela decide duas coisas: a resolução (±2 g
+//   é a mais fina) e a partir de quanto o sensor satura (numa batida acima de
+//   2 g, a escala ±2 g corta a leitura e o ângulo daquele instante sai errado).
+//   Aqui a escala é guardada em g, que é mais fácil de ler que o código 0–3.
+uint8_t escalaDoAcelerometroEmG = 2;
+
+// Sem nenhum aviso por este tempo, o fio do INT soltou ou o sensor travou, e o
+// motor é desligado. Vale o maior entre 10 avisos perdidos e 50 ms: com o
+// sensor rápido, 10 avisos seriam só 20 ms, e imprimir os ajustes na serial
+// já leva ~15 ms.
+const unsigned long AVISOS_PERDIDOS_PARA_DESISTIR = 10;
+const unsigned long TEMPO_MINIMO_SEM_AVISO_US     = 50000;
 
 // De quanto em quanto tempo mandar os números para o computador.
 const unsigned long INTERVALO_DA_TELEMETRIA_MS = 100;
@@ -285,9 +343,9 @@ void loop() {
   // Voltando de um sumiço, o intervalo seria enorme e o ângulo guardado está
   // velho: recomeçamos o ângulo pelo acelerômetro, como no setup().
   bool voltouDeUmSumico = !sensorAvisando ||
-                          microssegundosDesdeOUltimoCiclo > TEMPO_MAXIMO_SEM_AVISO_US;
+                          microssegundosDesdeOUltimoCiclo > tempoMaximoSemAvisoUs();
   if (voltouDeUmSumico) {
-    microssegundosDesdeOUltimoCiclo = INTERVALO_ENTRE_AMOSTRAS_US;
+    microssegundosDesdeOUltimoCiclo = intervaloEntreAmostrasUs();
   }
   sensorAvisando = true;
   float segundosDesdeOUltimoCiclo = microssegundosDesdeOUltimoCiclo / 1000000.0;
@@ -335,7 +393,7 @@ void loop() {
 // Sem avisos há tempo demais, o controle não roda — e o motor ficaria preso no
 // último comando. Melhor desligar.
 void verificarSeOSensorSumiu() {
-  if (!sensorAvisando || micros() - instanteDoUltimoCiclo <= TEMPO_MAXIMO_SEM_AVISO_US) {
+  if (!sensorAvisando || micros() - instanteDoUltimoCiclo <= tempoMaximoSemAvisoUs()) {
     return;
   }
   sensorAvisando = false;
@@ -343,6 +401,16 @@ void verificarSeOSensorSumiu() {
   pararMotor();
   digitalWrite(PINO_LED, LOW);
   Serial.println(F("# Falha: o MPU6050 parou de avisar pelo INT (D2). Motor desligado."));
+}
+
+// Intervalo esperado entre dois avisos do MPU6050: cada medição interna leva
+// 1 ms (1000 µs), e o divisor pula "divisor" delas.
+unsigned long intervaloEntreAmostrasUs() {
+  return 1000UL * (1 + divisorDeAmostragem);
+}
+
+unsigned long tempoMaximoSemAvisoUs() {
+  return max(AVISOS_PERDIDOS_PARA_DESISTIR * intervaloEntreAmostrasUs(), TEMPO_MINIMO_SEM_AVISO_US);
 }
 
 // Pisca rápido para sempre: algo está errado e não dá para continuar.
@@ -379,6 +447,9 @@ void travarComErro(const __FlashStringHelper *mensagem) {
 //  corrigida. Isso dá uma "constante de tempo" de
 //
 //      intervalo × peso / (1 − peso)  =  5 ms × 0,98 / 0,02  ≈  0,25 s
+//
+//  (5 ms é o intervalo com o divisor de amostragem padrão; com outro divisor,
+//  o mesmo peso corrige mais depressa ou mais devagar.)
 //
 //  Movimentos mais rápidos que isso vêm do giroscópio; tendências mais lentas,
 //  do acelerômetro.
@@ -419,7 +490,8 @@ float calcularAnguloPeloAcelerometro(const LeituraDoSensor &leitura) {
 // Todo giroscópio marca uma pequena velocidade mesmo parado. Medimos esse
 // desvio ao ligar, com o robô imóvel, e descontamos dele em todas as leituras.
 void calibrarGiroscopio() {
-  const int QUANTIDADE_DE_AMOSTRAS = 400;   // 400 amostras × 5 ms = 2 segundos
+  // Sempre 2 segundos de medições, seja qual for o divisor de amostragem.
+  const int QUANTIDADE_DE_AMOSTRAS = 2000000UL / intervaloEntreAmostrasUs();
 
   Serial.println(F("# Calibrando o giroscopio: deixe o robo PARADO por 2 segundos..."));
 
@@ -558,16 +630,16 @@ bool iniciarMPU6050() {
 
   bool tudoCerto = true;
 
-  // Filtro passa-baixas interno de ~44 Hz: tira boa parte da vibração do motor.
-  tudoCerto &= escreverRegistrador(REG_FILTRO_PASSA_BAIXAS, 0x03);
+  // Filtro passa-baixas e divisor de amostragem: veja a explicação junto de
+  // divisorDeAmostragem e filtroPassaBaixas, lá em cima. No registrador CONFIG
+  // os bits acima do filtro (sincronia externa) ficam em zero, por isso o valor
+  // do filtro vai direto.
+  tudoCerto &= escreverRegistrador(REG_FILTRO_PASSA_BAIXAS, filtroPassaBaixas);
+  tudoCerto &= escreverRegistrador(REG_DIVISOR_DE_AMOSTRAGEM, divisorDeAmostragem);
 
-  // Com esse filtro o sensor mede 1000 vezes por segundo; dividindo por 5
-  // chegamos a 200 por segundo, o mesmo ritmo do nosso controle.
-  tudoCerto &= escreverRegistrador(REG_DIVISOR_DE_AMOSTRAGEM, 4);
-
-  // Giroscópio em ±500 graus/s e acelerômetro em ±2 g.
+  // Giroscópio em ±500 graus/s. Acelerômetro na escala escolhida lá em cima.
   tudoCerto &= escreverRegistrador(REG_ESCALA_GIROSCOPIO, 0x08);
-  tudoCerto &= escreverRegistrador(REG_ESCALA_ACELEROMETRO, 0x00);
+  tudoCerto &= escreverRegistrador(REG_ESCALA_ACELEROMETRO, valorDoRegistradorDeEscala(escalaDoAcelerometroEmG));
 
   // Pino INT: sobe para nível alto num pulso curto (50 µs) a cada medição nova.
   // Nesse modo o pulso vem mesmo que a leitura anterior tenha se perdido; no
@@ -609,6 +681,28 @@ bool esperarAmostraNova() {
     }
   }
   return true;
+}
+
+// Arredonda um pedido qualquer ("escala_acelerometro 5") para a escala mais
+// próxima que o MPU6050 tem: 2, 4, 8 ou 16 g.
+uint8_t escalaDoAcelerometroMaisProxima(float pedidoEmG) {
+  if (pedidoEmG < 3)  return 2;
+  if (pedidoEmG < 6)  return 4;
+  if (pedidoEmG < 12) return 8;
+  return 16;
+}
+
+// No registrador ACCEL_CONFIG a escala fica nos bits 4 e 3 (AFS_SEL): 0 = ±2 g,
+// 1 = ±4 g, 2 = ±8 g, 3 = ±16 g. Os bits 7 a 5 (autoteste) ficam em zero.
+uint8_t valorDoRegistradorDeEscala(uint8_t escalaEmG) {
+  uint8_t afsSel = 0;
+  switch (escalaEmG) {
+    case 4:  afsSel = 1; break;
+    case 8:  afsSel = 2; break;
+    case 16: afsSel = 3; break;
+    default: afsSel = 0; break;   // 2 g
+  }
+  return afsSel << 3;
 }
 
 // Lê acelerômetro e giroscópio de uma vez. Devolve false se algo falhar.
@@ -687,7 +781,10 @@ void executarComando(char *linha) {
                         nomeDoComandoE(nome, "angulo_equilibrio") ||
                         nomeDoComandoE(nome, "pwm_minimo") ||
                         nomeDoComandoE(nome, "angulo_queda") ||
-                        nomeDoComandoE(nome, "peso_giroscopio");
+                        nomeDoComandoE(nome, "peso_giroscopio") ||
+                        nomeDoComandoE(nome, "divisor_amostragem") ||
+                        nomeDoComandoE(nome, "filtro_passa_baixas") ||
+                        nomeDoComandoE(nome, "escala_acelerometro");
   if (precisaDeValor && !veioComValor) {
     Serial.print(F("# Faltou o numero depois de \""));
     Serial.print(nome);
@@ -711,6 +808,29 @@ void executarComando(char *linha) {
     anguloDeQueda = constrain(valor, ANGULO_DE_QUEDA_MINIMO, ANGULO_DE_QUEDA_MAXIMO);
   } else if (nomeDoComandoE(nome, "peso_giroscopio")) {
     pesoDoGiroscopio = constrain(valor, 0.0, 1.0);
+  } else if (nomeDoComandoE(nome, "divisor_amostragem")) {
+    // Vai direto para o sensor. Só guarda o valor novo se ele aceitar: assim o
+    // que aparece em "valores" é sempre o que está gravado no MPU6050.
+    uint8_t novoDivisor = constrain((int)valor, DIVISOR_DE_AMOSTRAGEM_MINIMO, DIVISOR_DE_AMOSTRAGEM_MAXIMO);
+    if (escreverRegistrador(REG_DIVISOR_DE_AMOSTRAGEM, novoDivisor)) {
+      divisorDeAmostragem = novoDivisor;
+    } else {
+      Serial.println(F("# ERRO: o MPU6050 nao aceitou o divisor de amostragem."));
+    }
+  } else if (nomeDoComandoE(nome, "filtro_passa_baixas")) {
+    uint8_t novoFiltro = constrain((int)valor, FILTRO_PASSA_BAIXAS_MINIMO, FILTRO_PASSA_BAIXAS_MAXIMO);
+    if (escreverRegistrador(REG_FILTRO_PASSA_BAIXAS, novoFiltro)) {
+      filtroPassaBaixas = novoFiltro;
+    } else {
+      Serial.println(F("# ERRO: o MPU6050 nao aceitou o filtro passa-baixas."));
+    }
+  } else if (nomeDoComandoE(nome, "escala_acelerometro")) {
+    uint8_t novaEscala = escalaDoAcelerometroMaisProxima(valor);
+    if (escreverRegistrador(REG_ESCALA_ACELEROMETRO, valorDoRegistradorDeEscala(novaEscala))) {
+      escalaDoAcelerometroEmG = novaEscala;
+    } else {
+      Serial.println(F("# ERRO: o MPU6050 nao aceitou a escala do acelerometro."));
+    }
   } else if (nomeDoComandoE(nome, "telemetria")) {
     telemetriaLigada = !telemetriaLigada;
   } else if (nomeDoComandoE(nome, "valores")) {
@@ -744,6 +864,9 @@ void mostrarAjuda() {
   Serial.println(F("#   pwm_minimo 40           menor PWM que faz o motor girar"));
   Serial.println(F("#   angulo_queda 35         inclinacao a partir da qual o robo caiu (5 a 80)"));
   Serial.println(F("#   peso_giroscopio 0.98    quanto o filtro confia no giroscopio (0 a 1)"));
+  Serial.println(F("#   divisor_amostragem 4    medicoes por segundo = 1000 / (1 + divisor) (1 a 19)"));
+  Serial.println(F("#   filtro_passa_baixas 3   filtro do MPU6050: 1 = 188 Hz ... 6 = 5 Hz (1 a 6)"));
+  Serial.println(F("#   escala_acelerometro 2   faixa do acelerometro em g: 2, 4, 8 ou 16"));
   Serial.println(F("#   telemetria              liga/desliga o envio de numeros"));
   Serial.println(F("#   valores                 mostra os valores atuais"));
   Serial.println(F("#   ajuda                   mostra esta lista"));
@@ -759,6 +882,9 @@ void mostrarAjustes() {
   Serial.print(F("  pwm_minimo="));          Serial.print(pwmMinimo);
   Serial.print(F("  angulo_queda="));        Serial.print(anguloDeQueda, 1);
   Serial.print(F("  peso_giroscopio="));     Serial.print(pesoDoGiroscopio, 3);
+  Serial.print(F("  divisor_amostragem="));  Serial.print(divisorDeAmostragem);
+  Serial.print(F("  filtro_passa_baixas=")); Serial.print(filtroPassaBaixas);
+  Serial.print(F("  escala_acelerometro=")); Serial.print(escalaDoAcelerometroEmG);
   Serial.print(F("  telemetria="));          Serial.println(telemetriaLigada ? F("ligada") : F("desligada"));
 }
 

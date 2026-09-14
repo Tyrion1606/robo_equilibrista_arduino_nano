@@ -9,7 +9,7 @@ Só usa a biblioteca padrão do Python (termios, select): não precisa de pip.
 Conversa com o sketch robo_equilibrista.ino usando os comandos que ele entende
 ("kp 20", "valores", "marcar_equilibrio"...) e lendo duas linhas que ele imprime:
 
-  ajustes:     # kp=20.00  ki=0.00  kd=0.800  angulo_equilibrio=0.00  pwm_minimo=40  angulo_queda=35.0  peso_giroscopio=0.980  telemetria=ligada
+  ajustes:     # kp=20.00  ki=0.00  kd=0.800  angulo_equilibrio=0.00  pwm_minimo=40  angulo_queda=35.0  peso_giroscopio=0.980  divisor_amostragem=4  filtro_passa_baixas=3  telemetria=ligada
   telemetria:  angulo:-1.23,angulo_equilibrio:0.00,termo_P:-24.6,termo_I:0.0,termo_D:3.1,comando_motor:-21
 
 Se o formato dessas linhas mudar no sketch, ajuste este programa também.
@@ -24,9 +24,11 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import sys
 import termios
+import textwrap
 import time
 import tty
 from collections import deque
@@ -56,7 +58,8 @@ SEGUNDOS_ATE_A_TELEMETRIA_FICAR_VELHA = 1.5
 SEGUNDOS_AGUARDANDO_CONFIRMACAO = 1.0
 
 LIMITE_DO_ANGULO_DE_EQUILIBRIO = 35.0
-INTERVALO_ENTRE_AMOSTRAS_DO_SKETCH = 0.005   # 200 amostras por segundo, como no sketch
+LIMITE_DO_TERMO_INTEGRAL_NO_SKETCH = 120.0   # LIMITE_DO_TERMO_INTEGRAL do sketch
+ANGULO_PARA_REARMAR_NO_SKETCH = 3.0          # ANGULO_PARA_REARMAR do sketch
 LARGURA_DA_BARRA = 21                # ímpar, para existir um centro exato
 
 
@@ -65,46 +68,228 @@ class Parametro:
     nome: str                        # o mesmo nome do comando no sketch
     titulo: str
     casas_decimais: int              # as mesmas casas que o sketch usa ao imprimir
-    passo: float                     # ←/→
-    passo_grosso: float              # PgUp/PgDn
+    passo: float                     # ←/→ andam o passo; +/- andam 1/10 dele; PgUp/PgDn, 10 vezes ele
     minimo: float
     maximo: float
     inicio_da_barra: float           # faixa desenhada na barra: a faixa útil na prática
     fim_da_barra: float
     centrado: bool                   # barra com zero no meio (valores negativos fazem sentido)
     valor_padrao_do_sketch: float
-    explicacao: Callable[[float], str]
+    # Recebe o valor e todos os valores da tela; devolve os parágrafos da descrição.
+    explicacao: Callable[[float, dict[str, float]], list[str]]
+    # Quando só alguns valores existem (escala do acelerômetro: 2, 4, 8, 16),
+    # as teclas pulam de um para o outro em vez de somar o passo.
+    valores_permitidos: tuple[float, ...] = ()
+
+    @property
+    def passo_fino(self) -> float:
+        # Um décimo do passo, mas nunca menor que a última casa decimal que o
+        # sketch imprime: um ajuste que o robô não consegue mostrar não serve.
+        # Por isso, nos valores inteiros (pwm_minimo, divisor, filtro), +/- andam de 1 em 1.
+        return max(self.passo / 10, 10 ** -self.casas_decimais)
+
+    @property
+    def passo_grosso(self) -> float:
+        return self.passo * 10
+
+
+# Filtro passa-baixas do MPU6050 (datasheet): corte em Hz e atraso em ms.
+FILTRO_PASSA_BAIXAS_DO_GIROSCOPIO = {1: (188, 1.9), 2: (98, 2.8), 3: (42, 4.8), 4: (20, 8.3), 5: (10, 13.4), 6: (5, 18.6)}
+FILTRO_PASSA_BAIXAS_DO_ACELEROMETRO = {1: (184, 2.0), 2: (94, 3.0), 3: (44, 4.9), 4: (21, 8.5), 5: (10, 13.8), 6: (5, 19.0)}
+
+
+def segundos_entre_amostras(divisor_de_amostragem: float) -> float:
+    # Com o filtro ligado o MPU6050 mede 1000 vezes por segundo por dentro.
+    return (1 + divisor_de_amostragem) / 1000
+
+
+# -----------------------------------------------------------------------------
+#  Descrições: o texto que aparece embaixo da tabela para o parâmetro escolhido.
+#  Cada função devolve parágrafos; os números são calculados com os valores da
+#  tela, então a descrição acompanha o que está sendo ajustado.
+# -----------------------------------------------------------------------------
+
+def descrever_kp(kp: float, valores: dict[str, float]) -> list[str]:
+    if kp > 0:
+        saturacao = (f"Com {kp:.2f}, 1° de inclinação vira {kp:.1f} de comando e 5° viram {5 * kp:.0f}; "
+                     f"a partir de {255 / kp:.1f}° só o P já pede o motor no máximo (255).")
+    else:
+        saturacao = "Em 0, o P está desligado: a inclinação sozinha não gera nenhuma força."
+    return [
+        "Reage ao TAMANHO da inclinação: quanto mais longe do ângulo de equilíbrio, mais força no motor, "
+        "sempre empurrando as rodas para baixo do robô. É o termo principal: sem ele o robô não se levanta. " + saturacao,
+        "Aumentar: reage mais forte e cai menos, mas passa do ponto e começa a balançar para a frente e para trás, "
+        "cada vez mais rápido. Diminuir: reações moles; o robô tomba devagar sem conseguir voltar.",
+        "Como ajustar: com ki e kd em 0, suba até o robô oscilar sozinho; depois use o kd para amortecer "
+        "e, se ainda tremer, tire 10 a 20% do kp.",
+    ]
+
+
+def descrever_ki(ki: float, valores: dict[str, float]) -> list[str]:
+    return [
+        "Reage ao TEMPO que o robô passa inclinado: soma o erro a cada medição e vai empurrando cada vez mais. "
+        f"Com {ki:.2f}, 1° mantido por 1 segundo acumula {ki:.1f} de comando; o termo I nunca passa de "
+        f"±{LIMITE_DO_TERMO_INTEGRAL_NO_SKETCH:.0f} e é zerado sempre que o robô é levantado.",
+        "Serve para o robô que fica em pé mas vai andando para um lado até cair, porque o ângulo de equilíbrio "
+        "está um pouco errado ou o peso é desigual. Aumentar: corrige essa tendência mais depressa; em excesso, "
+        "oscilações lentas e largas e um 'disparo' depois de cada empurrão. Diminuir: sobra um pequeno desvio.",
+        "Como ajustar: deixe em 0 até kp e kd estarem bons e acerte antes o angulo_equilibrio (tecla m). "
+        "Depois suba aos poucos.",
+    ]
+
+
+def descrever_kd(kd: float, valores: dict[str, float]) -> list[str]:
+    return [
+        "Reage à VELOCIDADE da queda, medida direto pelo giroscópio: funciona como um freio que segura o "
+        f"movimento antes de ele crescer. Com {kd:.3f}, caindo a 100 °/s vira {kd * 100:.0f} de comando; "
+        f"um tranco de 300 °/s vira {kd * 300:.0f}.",
+        "Aumentar: amortece o balanço causado pelo kp e deixa o robô firme. Em excesso, amplifica o ruído do "
+        "giroscópio e a vibração do motor: o robô treme rápido e o motor zumbe. Diminuir: balança várias vezes "
+        "antes de parar.",
+        "Como ajustar: depois de achar o kp que faz oscilar, suba o kd até a oscilação sumir. Se aparecer "
+        "zumbido, reduza o kd ou suba o filtro_passa_baixas.",
+    ]
+
+
+def descrever_angulo_de_equilibrio(angulo: float, valores: dict[str, float]) -> list[str]:
+    return [
+        f"O ângulo que o robô tenta manter, em graus (positivo = inclinado para a frente). Agora: {angulo:+.2f}°. "
+        "Quase nunca é 0: depende de onde está o centro de massa (bateria, placas) e de quão reto o MPU6050 foi "
+        "preso. Muda sempre que algo pesado muda de lugar.",
+        "Se estiver errado, o robô até fica em pé, mas não para quieto: para se manter num ângulo que não é o de "
+        "equilíbrio, ele precisa acelerar o tempo todo. Anda para trás sem parar: aumente. Anda para a frente: "
+        "diminua.",
+        "O jeito mais fácil: segure o robô com a mão no ponto em que ele quase fica em pé sozinho e aperte m.",
+    ]
+
+
+def descrever_pwm_minimo(pwm: float, valores: dict[str, float]) -> list[str]:
+    return [
+        "Motores pequenos com caixa de redução não giram com PWM baixo: o atrito e a folga das engrenagens "
+        "seguram a roda e o motor só zumbe (a 'zona morta'). Todo comando diferente de zero começa a partir "
+        f"deste valor: o comando 1 vira PWM {pwm:.0f} ({pwm / 255 * 100:.0f}% da tensão) e o 255 continua 255.",
+        "Aumentar: correções pequenas já movem a roda, e o robô não 'deixa cair' antes de reagir. Em excesso, "
+        "cada correção mínima vira um tranco e o robô treme parado. Diminuir: o motor ignora comandos pequenos "
+        "e o robô balança em volta do equilíbrio.",
+        "Como achar: kp baixo e kd 0, segure o robô inclinado e suba até a roda girar de verdade; use esse "
+        "valor ou um pouco menos.",
+    ]
+
+
+def descrever_angulo_de_queda(queda: float, valores: dict[str, float]) -> list[str]:
+    equilibrio = valores["angulo_equilibrio"]
+    return [
+        f"Margem de segurança. Se o ângulo sair da faixa de {equilibrio - queda:+.1f}° a {equilibrio + queda:+.1f}° "
+        f"({queda:.1f}° para cada lado do equilíbrio), o robô é considerado caído: o motor desliga e o PID é zerado. "
+        f"Ele só volta a equilibrar quando for levantado até {ANGULO_PARA_REARMAR_NO_SKETCH:.0f}° do equilíbrio.",
+        "Aumentar: tenta salvar inclinações maiores, mas o motor pode ficar girando com o robô deitado, "
+        "arrastando no chão. Diminuir: desiste cedo, até de quedas que ainda dava para salvar.",
+        "Com um motor TT, passar de uns 30° quase nunca tem volta; valores entre 25° e 45° costumam funcionar.",
+    ]
+
+
+def descrever_peso_do_giroscopio(peso: float, valores: dict[str, float]) -> list[str]:
+    intervalo = segundos_entre_amostras(valores["divisor_amostragem"])
+    mistura = (f"A cada medição, o ângulo mistura {peso * 100:.1f}% do giroscópio (liso, mas escorrega aos poucos) "
+               f"com {(1 - peso) * 100:.1f}% do acelerômetro (nunca escorrega, mas sente trancos e vibração como "
+               "se fossem inclinação).")
+    if peso >= 1.0:
+        velocidade = "Em 1.000 o acelerômetro é ignorado: nada corrige o escorregamento e o ângulo desvia até o robô cair."
+    elif peso <= 0.0:
+        velocidade = "Em 0.000 só o acelerômetro conta: cada aceleração das rodas aparece como inclinação e o robô treme."
+    else:
+        constante_de_tempo = intervalo * peso / (1 - peso)
+        velocidade = (f"Com {1 / intervalo:.0f} medições por segundo, o acelerômetro corrige o ângulo em ~"
+                      f"{constante_de_tempo * 1000:.0f} ms (constante de tempo): movimentos mais rápidos que isso vêm "
+                      "do giroscópio; tendências mais lentas, do acelerômetro. Muda junto com o divisor_amostragem.")
+    return [
+        mistura,
+        velocidade,
+        "Aumentar (0.99, 0.995): ângulo mais liso e menos afetado pelo motor, mas o escorregamento do giroscópio "
+        "demora a ser corrigido e o robô vai 'andando'. Diminuir (0.95): corrige depressa, mas a aceleração das "
+        "rodas entra no ângulo e o robô treme.",
+    ]
+
+
+def descrever_divisor_de_amostragem(divisor: float, valores: dict[str, float]) -> list[str]:
+    intervalo = segundos_entre_amostras(divisor)
+    medicoes_por_segundo = 1 / intervalo
+    corte, _ = FILTRO_PASSA_BAIXAS_DO_GIROSCOPIO[int(valores["filtro_passa_baixas"])]
+    paragrafos = [
+        "Quantas medições por segundo o MPU6050 entrega (registrador SMPLRT_DIV). Por dentro ele mede 1000 vezes "
+        f"por segundo e só avisa uma a cada (1 + divisor): agora {medicoes_por_segundo:.0f} por segundo, uma a cada "
+        f"{intervalo * 1000:.0f} ms. Cada aviso roda um ciclo inteiro: sensor, filtro, PID e motor.",
+        "Diminuir (mais rápido): o PID percebe a queda antes, mas sobra menos tempo para ler o I2C (~1 ms) e "
+        f"mandar a telemetria. Aumentar: folga de sobra, mas o motor só é corrigido a cada {intervalo * 1000:.0f} ms; "
+        "acima de 10 ms fica difícil equilibrar. Também muda o efeito do peso_giroscopio.",
+    ]
+    if medicoes_por_segundo < 2 * corte:
+        paragrafos.append(
+            f"Atenção: com o filtro_passa_baixas em {corte} Hz, medir menos de {2 * corte} vezes por segundo cria "
+            "oscilações lentas falsas (aliasing). Diminua o divisor ou suba o filtro.")
+    else:
+        paragrafos.append(
+            f"Combina com o filtro_passa_baixas ({corte} Hz): mede mais que o dobro da maior vibração que o filtro "
+            "deixa passar, então nenhuma vibração vira oscilação falsa (aliasing).")
+    return paragrafos
+
+
+def descrever_filtro_passa_baixas(filtro: float, valores: dict[str, float]) -> list[str]:
+    corte, atraso = FILTRO_PASSA_BAIXAS_DO_GIROSCOPIO[int(filtro)]
+    corte_do_acelerometro, _ = FILTRO_PASSA_BAIXAS_DO_ACELEROMETRO[int(filtro)]
+    intervalo_em_ms = segundos_entre_amostras(valores["divisor_amostragem"]) * 1000
+    opcoes = " · ".join(f"{n} = {c} Hz/{a} ms" for n, (c, a) in FILTRO_PASSA_BAIXAS_DO_GIROSCOPIO.items())
+    return [
+        "Filtro digital dentro do MPU6050 (registrador CONFIG), aplicado antes de o Nano ler. Agora: corta o que "
+        f"vibra acima de {corte} Hz no giroscópio ({corte_do_acelerometro} Hz no acelerômetro) e atrasa a leitura "
+        f"em {atraso} ms, o equivalente a {atraso / intervalo_em_ms:.1f} medição(ões).",
+        "Subir (filtro mais forte): tira mais vibração do motor e das engrenagens e limpa o termo D, mas o atraso "
+        "cresce; um robô que tomba em 50 a 100 ms passa a ser corrigido com informação velha e oscila. Descer: "
+        "resposta mais rápida, porém mais ruído; com kd alto o motor zumbe.",
+        f"Opções: {opcoes}.",
+    ]
+
+
+def descrever_escala_do_acelerometro(escala: float, valores: dict[str, float]) -> list[str]:
+    unidades_por_g = 32768 / escala
+    return [
+        f"Até quanto o acelerômetro mede (registrador ACCEL_CONFIG): agora ±{escala:.0f} g, com "
+        f"{unidades_por_g:.0f} unidades por g (cada unidade vale {1000 / unidades_por_g:.2f} mg). Parado, o robô "
+        "mede 1 g; trancos, batidas e a vibração do motor passam disso por instantes.",
+        "O ângulo pelo acelerômetro usa só a proporção entre os eixos X e Z, então nenhuma conta muda com a escala: "
+        "ela decide a resolução e o ponto em que o sensor satura (corta a leitura e o ângulo daquele instante sai "
+        "errado).",
+        "Escala menor (±2 g): mais resolução, mas uma batida acima de 2 g é cortada. Escala maior (±16 g): nunca "
+        "satura, mas cada unidade vale 8 vezes mais e o ângulo fica mais granulado. Para equilibrar, ±2 g ou ±4 g "
+        "costumam ser o melhor. Opções: 2, 4, 8 ou 16 g.",
+    ]
 
 
 PARAMETROS = [
-    Parametro("kp", "ganho proporcional", 2, 0.5, 5.0, 0.0, 1000.0, 0.0, 100.0, False, 20.0,
-              lambda v: f"1 grau de inclinação vira {v:.1f} de comando no motor"),
-    Parametro("ki", "ganho integral", 2, 1.0, 10.0, 0.0, 10000.0, 0.0, 300.0, False, 0.0,
-              lambda v: f"1 grau mantido por 1 segundo acumula {v:.1f} de comando"),
-    Parametro("kd", "ganho derivativo", 3, 0.05, 0.5, 0.0, 100.0, 0.0, 5.0, False, 0.8,
-              lambda v: f"caindo a 100 graus/s vira {v * 100:.0f} de comando"),
-    Parametro("angulo_equilibrio", "ângulo de equilíbrio", 2, 0.1, 1.0,
+    Parametro("kp", "kp · ganho proporcional", 2, 0.5, 0.0, 1000.0, 0.0, 100.0, False, 20.0, descrever_kp),
+    Parametro("ki", "ki · ganho integral", 2, 1.0, 0.0, 10000.0, 0.0, 300.0, False, 0.0, descrever_ki),
+    Parametro("kd", "kd · ganho derivativo", 3, 0.05, 0.0, 100.0, 0.0, 5.0, False, 0.8, descrever_kd),
+    Parametro("angulo_equilibrio", "angulo_equilibrio · ângulo de equilíbrio", 2, 0.1,
               -LIMITE_DO_ANGULO_DE_EQUILIBRIO, LIMITE_DO_ANGULO_DE_EQUILIBRIO,
-              -10.0, 10.0, True, 0.0,
-              lambda v: f"o robô tenta ficar parado inclinado {v:+.2f}°"),
-    Parametro("pwm_minimo", "PWM mínimo do motor", 0, 1.0, 10.0, 0.0, 254.0, 0.0, 255.0, False, 40.0,
-              lambda v: f"qualquer comando começa em {v:.0f} de PWM, para vencer a zona morta"),
-    # Os limites de angulo_queda e peso_giroscopio são os mesmos do constrain() no sketch.
-    Parametro("angulo_queda", "ângulo de queda", 1, 1.0, 5.0, 5.0, 80.0, 0.0, 80.0, False, 35.0,
-              lambda v: f"passou de {v:.0f}° longe do equilíbrio: desliga o motor e espera ser levantado"),
-    Parametro("peso_giroscopio", "peso do giroscópio no filtro", 3, 0.005, 0.02, 0.0, 1.0, 0.9, 1.0, False, 0.98,
-              lambda v: explicar_peso_do_giroscopio(v)),
+              -10.0, 10.0, True, 0.0, descrever_angulo_de_equilibrio),
+    Parametro("pwm_minimo", "pwm_minimo · PWM mínimo do motor", 0, 1.0, 0.0, 254.0, 0.0, 255.0, False, 40.0,
+              descrever_pwm_minimo),
+    # Daqui para baixo, os limites são os mesmos do sketch.
+    Parametro("angulo_queda", "angulo_queda · ângulo de queda", 1, 1.0, 5.0, 80.0, 0.0, 80.0, False, 35.0,
+              descrever_angulo_de_queda),
+    Parametro("peso_giroscopio", "peso_giroscopio · peso do giroscópio no filtro complementar", 3, 0.005,
+              0.0, 1.0, 0.9, 1.0, False, 0.98, descrever_peso_do_giroscopio),
+    Parametro("divisor_amostragem", "divisor_amostragem · divisor de amostragem do MPU6050", 0, 1.0,
+              1.0, 19.0, 1.0, 19.0, False, 4.0, descrever_divisor_de_amostragem),
+    Parametro("filtro_passa_baixas", "filtro_passa_baixas · filtro passa-baixas do MPU6050", 0, 1.0,
+              1.0, 6.0, 1.0, 6.0, False, 3.0, descrever_filtro_passa_baixas),
+    Parametro("escala_acelerometro", "escala_acelerometro · escala do acelerômetro, em g", 0, 1.0,
+              2.0, 16.0, 2.0, 16.0, False, 2.0, descrever_escala_do_acelerometro,
+              valores_permitidos=(2.0, 4.0, 8.0, 16.0)),
 ]
 PARAMETRO_POR_NOME = {parametro.nome: parametro for parametro in PARAMETROS}
+LARGURA_DO_NOME = max(len(parametro.nome) for parametro in PARAMETROS) + 1   # coluna dos nomes na tela
 
-
-def explicar_peso_do_giroscopio(peso: float) -> str:
-    mistura = f"{peso * 100:.1f}% giroscópio + {(1 - peso) * 100:.1f}% acelerômetro"
-    if peso >= 1.0:
-        return f"{mistura}: o acelerômetro nunca corrige, o ângulo vai escorregar"
-    # Constante de tempo do filtro complementar: intervalo × peso / (1 − peso).
-    constante_de_tempo = INTERVALO_ENTRE_AMOSTRAS_DO_SKETCH * peso / (1 - peso)
-    return f"{mistura}: o acelerômetro corrige o ângulo em ~{constante_de_tempo * 1000:.0f} ms"
 
 # Nomes das variáveis no sketch, para imprimir o trecho de código ao sair.
 VARIAVEL_NO_SKETCH = {
@@ -115,6 +300,9 @@ VARIAVEL_NO_SKETCH = {
     "pwm_minimo": "int pwmMinimo",
     "angulo_queda": "float anguloDeQueda",
     "peso_giroscopio": "float pesoDoGiroscopio",
+    "escala_acelerometro": "uint8_t escalaDoAcelerometroEmG",
+    "divisor_amostragem": "uint8_t divisorDeAmostragem",
+    "filtro_passa_baixas": "uint8_t filtroPassaBaixas",
 }
 
 
@@ -527,7 +715,7 @@ class AjusteDoPid:
 
     def tratar_tecla(self, tecla: str) -> None:
         parametro = PARAMETROS[self.indice_selecionado]
-        e_digito = len(tecla) == 1 and tecla in "0123456789-.,"
+        e_digito = len(tecla) == 1 and tecla in "0123456789.,"
 
         if self.texto_em_edicao is not None:
             if tecla in ("\r", "\n"):
@@ -538,6 +726,12 @@ class AjusteDoPid:
                 self.texto_em_edicao = self.texto_em_edicao[:-1]
             elif e_digito and len(self.texto_em_edicao) < 10:
                 self.texto_em_edicao += "." if tecla == "," else tecla
+            elif tecla == "-":
+                # Durante a digitação o "-" troca o sinal, porque fora dela ele diminui o valor.
+                if self.texto_em_edicao.startswith("-"):
+                    self.texto_em_edicao = self.texto_em_edicao[1:]
+                else:
+                    self.texto_em_edicao = "-" + self.texto_em_edicao
             elif tecla in ("CIMA", "BAIXO"):
                 self.texto_em_edicao = None
                 self.mover_selecao(-1 if tecla == "CIMA" else 1)
@@ -553,6 +747,10 @@ class AjusteDoPid:
             self.ajustar(parametro, parametro.passo)
         elif tecla == "ESQUERDA":
             self.ajustar(parametro, -parametro.passo)
+        elif tecla in ("+", "="):                         # "=" é o "+" sem Shift
+            self.ajustar(parametro, parametro.passo_fino)
+        elif tecla == "-":
+            self.ajustar(parametro, -parametro.passo_fino)
         elif tecla == "PGUP":
             self.ajustar(parametro, parametro.passo_grosso)
         elif tecla == "PGDN":
@@ -584,7 +782,14 @@ class AjusteDoPid:
 
     def ajustar(self, parametro: Parametro, quanto: float) -> None:
         atual = self.valores_na_interface[parametro.nome]
-        novo = round(limitar(atual + quanto, parametro.minimo, parametro.maximo), parametro.casas_decimais)
+        if parametro.valores_permitidos:
+            # Qualquer tecla de ajuste só anda uma posição na lista (2 → 4 → 8 → 16).
+            permitidos = parametro.valores_permitidos
+            posicao = permitidos.index(valor_permitido_mais_proximo(parametro, atual))
+            posicao = int(limitar(posicao + (1 if quanto > 0 else -1), 0, len(permitidos) - 1))
+            novo = permitidos[posicao]
+        else:
+            novo = round(limitar(atual + quanto, parametro.minimo, parametro.maximo), parametro.casas_decimais)
         self.valores_na_interface[parametro.nome] = novo
         if self.envio_automatico:
             self.envio_automatico_agendado_para[parametro.nome] = time.monotonic() + SEGUNDOS_DE_PAUSA_NO_ENVIO_AUTOMATICO
@@ -597,10 +802,16 @@ class AjusteDoPid:
         except ValueError:
             self.avisar(ERRO, f"\"{texto}\" não é um número")
             return
-        valor_limitado = round(limitar(valor, parametro.minimo, parametro.maximo), parametro.casas_decimais)
-        if valor_limitado != round(valor, parametro.casas_decimais):
-            self.avisar(AVISO, f"{parametro.nome} vai de {formatar(parametro, parametro.minimo)} "
-                               f"a {formatar(parametro, parametro.maximo)}: usei {formatar(parametro, valor_limitado)}")
+        if parametro.valores_permitidos:
+            valor_limitado = valor_permitido_mais_proximo(parametro, valor)
+            if valor_limitado != valor:
+                opcoes = ", ".join(formatar(parametro, v) for v in parametro.valores_permitidos)
+                self.avisar(AVISO, f"{parametro.nome} só aceita {opcoes}: usei {formatar(parametro, valor_limitado)}")
+        else:
+            valor_limitado = round(limitar(valor, parametro.minimo, parametro.maximo), parametro.casas_decimais)
+            if valor_limitado != round(valor, parametro.casas_decimais):
+                self.avisar(AVISO, f"{parametro.nome} vai de {formatar(parametro, parametro.minimo)} "
+                                   f"a {formatar(parametro, parametro.maximo)}: usei {formatar(parametro, valor_limitado)}")
         self.valores_na_interface[parametro.nome] = valor_limitado
         self.enviar_parametro(parametro)
 
@@ -614,52 +825,89 @@ class AjusteDoPid:
 
     def desenhar(self) -> None:
         agora = time.monotonic()
-        parametro = PARAMETROS[self.indice_selecionado]
-        valor = self.valores_na_interface[parametro.nome]
+        largura, altura = shutil.get_terminal_size((100, 40))
 
-        linhas = [
-            pintar(TITULO, " Ajuste do PID — robô equilibrista"),
+        cabecalho = [
             self.linha_da_conexao(),
             "",
             *(self.linha_do_parametro(indice, p, agora) for indice, p in enumerate(PARAMETROS)),
             "",
-            pintar(APAGADO, f"   {parametro.titulo}: {parametro.explicacao(valor)}"),
-            "",
-            *self.linhas_do_robo(agora),
-            "",
-            *self.linhas_das_mensagens(),
-            "",
-            *self.linhas_do_rodape(),
         ]
+        robo = ["", *self.linhas_do_robo(agora), ""]
+        rodape = ["", *self.linhas_do_rodape(largura)]
+
+        # A tela inteira tem de caber na altura do terminal: se passar, ele rola e
+        # tudo sai do lugar. Mensagens ficam com 1 a 5 linhas e a descrição com o resto.
+        espaco_livre = altura - len(cabecalho) - len(robo) - len(rodape)
+        altura_da_descricao = self.altura_da_descricao(largura)
+        linhas_de_mensagem = int(limitar(espaco_livre - altura_da_descricao, 1, self.mensagens.maxlen))
+        altura_da_descricao = max(0, espaco_livre - linhas_de_mensagem)
+
+        linhas = [
+            *cabecalho,
+            *self.linhas_da_descricao(PARAMETROS[self.indice_selecionado], largura, altura_da_descricao),
+            *robo,
+            *self.linhas_das_mensagens(linhas_de_mensagem, largura),
+            *rodape,
+        ][:altura]
 
         inicio = "\033[2J\033[H" if self.precisa_limpar_a_tela else "\033[H"
         self.precisa_limpar_a_tela = False
-        tela = inicio + "".join(linha + "\033[K\n" for linha in linhas) + "\033[J"
+        # Sem "\n" depois da última linha: com a tela cheia, ele faria o terminal rolar.
+        tela = inicio + "\033[K\n".join(linhas) + "\033[K\033[J"
         os.write(sys.stdout.fileno(), tela.encode("utf-8"))
         self.precisa_redesenhar = False
+
+    def paragrafos_quebrados(self, parametro: Parametro, largura: int) -> list[str]:
+        """Título e descrição do parâmetro, quebrados na largura do terminal (sem cores)."""
+        largura_do_texto = max(30, largura - 4)
+        paragrafos = parametro.explicacao(self.valores_na_interface[parametro.nome], self.valores_na_interface)
+        paragrafos[0] = f"{parametro.titulo} — {paragrafos[0]}"      # o título abre o primeiro parágrafo
+        linhas = []
+        for paragrafo in paragrafos:
+            linhas += textwrap.wrap(paragrafo, largura_do_texto)
+        return linhas
+
+    def altura_da_descricao(self, largura: int) -> int:
+        # A maior descrição de todas, para a tela não pular ao trocar de parâmetro.
+        return max(len(self.paragrafos_quebrados(p, largura)) for p in PARAMETROS)
+
+    def linhas_da_descricao(self, parametro: Parametro, largura: int, altura: int) -> list[str]:
+        if altura <= 0:
+            return []
+        linhas = ["   " + linha for linha in self.paragrafos_quebrados(parametro, largura)]
+        linhas[0] = linhas[0].replace(parametro.titulo, pintar(NEGRITO, parametro.titulo), 1)
+        if len(linhas) > altura:
+            linhas = linhas[:altura - 1] + [pintar(APAGADO, "   … aumente a altura do terminal para ler o resto")]
+        return linhas + [""] * (altura - len(linhas))
 
     def linha_da_conexao(self) -> str:
         automatico = "envio automático " + (pintar(SUCESSO, "ligado") if self.envio_automatico else "desligado")
         if self.porta:
             situacao = pintar(SUCESSO, "● ") + f"{self.porta.caminho} conectado"
             if self.sincronizacao_pendente:
-                situacao += pintar(APAGADO, " · esperando o robô iniciar")
+                situacao += pintar(APAGADO, ", esperando o robô iniciar")
         elif self.conexao_pausada_pelo_usuario:
             situacao = pintar(APAGADO, "○ porta liberada (c conecta)")
         else:
             onde = self.porta_escolhida_na_linha_de_comando or ", ".join(PADROES_DE_PORTA)
             situacao = pintar(ERRO, "○ ") + f"procurando o robô em {onde}"
-        return f" {situacao}   {pintar(APAGADO, '·')}   {automatico}"
+        return f" {pintar(TITULO, 'pid-robot')}   {situacao}   {pintar(APAGADO, '·')}   {automatico}"
 
     def linha_do_parametro(self, indice: int, parametro: Parametro, agora: float) -> str:
         selecionado = indice == self.indice_selecionado
         valor = self.valores_na_interface[parametro.nome]
 
         marcador = pintar(TITULO, "▶") if selecionado else " "
-        nome = parametro.nome.ljust(18)
+        nome = parametro.nome.ljust(LARGURA_DO_NOME)
         nome = pintar(NEGRITO, nome) if selecionado else nome
 
-        fracao = (valor - parametro.inicio_da_barra) / (parametro.fim_da_barra - parametro.inicio_da_barra)
+        if parametro.valores_permitidos:
+            # Barra pela posição na lista: 2, 4, 8 e 16 ficam igualmente espaçados.
+            posicao = parametro.valores_permitidos.index(valor_permitido_mais_proximo(parametro, valor))
+            fracao = posicao / (len(parametro.valores_permitidos) - 1)
+        else:
+            fracao = (valor - parametro.inicio_da_barra) / (parametro.fim_da_barra - parametro.inicio_da_barra)
         barra = barra_com_marcador(fracao) if parametro.centrado else barra_cheia(fracao)
 
         if selecionado and self.texto_em_edicao is not None:
@@ -677,7 +925,7 @@ class AjusteDoPid:
             return pintar(AVISO, "● não enviado (Enter)")
         if nome not in self.valores_no_robo:
             if self.porta and self.robo_informou_ajustes:
-                return pintar(AVISO, "✗ o sketch do robô não tem este ajuste")
+                return pintar(AVISO, "✗ o sketch do robô é antigo")
             return pintar(APAGADO, "✓ enviado · sem resposta do robô" if self.porta else "✓ guardado")
         if valores_iguais(parametro, self.valores_no_robo[nome], self.valores_enviados[nome]):
             return pintar(SUCESSO, "✓ no robô")
@@ -698,16 +946,15 @@ class AjusteDoPid:
         else:
             telemetria = "telemetria " + ("ligada" if self.telemetria_ligada else pintar(AVISO, "desligada"))
 
-        cabecalho = f" {pintar(NEGRITO, 'Robô')}   {estado}   {pintar(APAGADO, '·')}   {telemetria}"
+        cabecalho = f" {pintar(NEGRITO, 'Robô')}   {estado}   {pintar(APAGADO, '·')}   {telemetria}   {pintar(APAGADO, '·')}   "
 
         recente = self.porta is not None and agora - self.momento_da_ultima_telemetria < SEGUNDOS_ATE_A_TELEMETRIA_FICAR_VELHA
         if not recente:
             vazia = pintar(APAGADO, "[" + "·" * LARGURA_DA_BARRA + "]")
             return [
-                cabecalho,
-                f"   {'ângulo'.ljust(16)} {vazia} {'—'.rjust(10)}",
-                f"   {'comando motor'.ljust(16)} {vazia} {'—'.rjust(10)}",
-                pintar(APAGADO, "   sem telemetria recente" + ("" if self.porta else " (robô desconectado)")),
+                cabecalho + pintar(APAGADO, "sem telemetria recente" + ("" if self.porta else " (robô desconectado)")),
+                f"   {'ângulo'.ljust(LARGURA_DO_NOME)} {vazia} {'—'.rjust(10)}",
+                f"   {'comando motor'.ljust(LARGURA_DO_NOME)} {vazia} {'—'.rjust(10)}",
             ]
 
         angulo = self.telemetria.get("angulo", 0.0)
@@ -723,36 +970,46 @@ class AjusteDoPid:
         fracao_do_angulo = (angulo + queda) / (2 * queda)
         fracao_do_alvo = (alvo + queda) / (2 * queda)
 
-        termos = "   ".join(f"{letra} {self.telemetria.get('termo_' + letra, 0.0):+7.1f}" for letra in "PID")
+        termos = "  ".join(f"{letra} {self.telemetria.get('termo_' + letra, 0.0):+.1f}" for letra in "PID")
         return [
-            cabecalho,
-            f"   {'ângulo'.ljust(16)} {barra_com_marcador(fracao_do_angulo, fracao_do_alvo)} {f'{angulo:+.2f}°'.rjust(10)}"
+            cabecalho + termos,
+            f"   {'ângulo'.ljust(LARGURA_DO_NOME)} {barra_com_marcador(fracao_do_angulo, fracao_do_alvo)} {f'{angulo:+.2f}°'.rjust(10)}"
             + pintar(APAGADO, f"   ±{queda:.0f}°"),
-            f"   {'comando motor'.ljust(16)} {barra_a_partir_do_centro(comando / 255)} {f'{comando:+.0f}'.rjust(10)}"
+            f"   {'comando motor'.ljust(LARGURA_DO_NOME)} {barra_a_partir_do_centro(comando / 255)} {f'{comando:+.0f}'.rjust(10)}"
             + pintar(APAGADO, "   ±255"),
-            f"   {'termos do PID'.ljust(16)} {termos}",
         ]
 
-    def linhas_das_mensagens(self) -> list[str]:
+    def linhas_das_mensagens(self, quantidade: int, largura: int) -> list[str]:
         linhas = []
-        for hora, cor, texto in self.mensagens:
+        largura_do_texto = max(10, largura - 14)
+        for hora, cor, texto in list(self.mensagens)[-quantidade:]:
+            if len(texto) > largura_do_texto:                # uma mensagem longa quebraria a tela
+                texto = texto[:largura_do_texto - 1] + "…"
             linhas.append(f"   {pintar(APAGADO, hora)}  {pintar(cor, texto) if cor else texto}")
         # Sempre o mesmo número de linhas, para o rodapé não pular.
-        return linhas + [""] * (self.mensagens.maxlen - len(linhas))
+        return linhas + [""] * (quantidade - len(linhas))
 
-    def linhas_do_rodape(self) -> list[str]:
-        def atalho(teclas: str, acao: str) -> str:
-            return f"{teclas} {pintar(APAGADO, acao)}"
-
-        separador = pintar(APAGADO, "  •  ")
-        return [
-            " " + separador.join([atalho("↑/↓", "escolhe"), atalho("←/→", "ajusta"),
-                                  atalho("PgUp/PgDn", "ajusta ×10"), atalho("0–9", "digita um valor")]),
-            " " + separador.join([atalho("Enter", "envia"), atalho("e", "envia todos"),
-                                  atalho("u", "volta ao último envio"), atalho("a", "envio automático")]),
-            " " + separador.join([atalho("m", "marca o ângulo atual como equilíbrio"), atalho("t", "telemetria"),
-                                  atalho("c", "conecta/libera a porta"), atalho("q", "sai")]),
+    def linhas_do_rodape(self, largura: int) -> list[str]:
+        atalhos = [
+            ("↑/↓", "escolhe"), ("←/→", "ajusta"), ("+/-", "×0,1"), ("PgUp/PgDn", "×10"),
+            ("0–9", "digita (- troca o sinal)"), ("Enter", "envia"), ("e", "envia todos"),
+            ("u", "volta ao último envio"), ("a", "envio automático"), ("m", "marca o equilíbrio aqui"),
+            ("t", "telemetria"), ("c", "libera/conecta a porta"), ("q", "sai"),
         ]
+        separador = "  •  "
+        # Enche cada linha com quantos atalhos couberem na largura do terminal.
+        linhas: list[list[tuple[str, str]]] = [[]]
+        ocupado = 1
+        for teclas, acao in atalhos:
+            tamanho = len(teclas) + 1 + len(acao)
+            extra = tamanho + (len(separador) if linhas[-1] else 0)
+            if linhas[-1] and ocupado + extra > largura - 1:
+                linhas.append([])
+                ocupado, extra = 1, tamanho
+            linhas[-1].append((teclas, acao))
+            ocupado += extra
+        return [" " + pintar(APAGADO, separador).join(f"{teclas} {pintar(APAGADO, acao)}" for teclas, acao in linha)
+                for linha in linhas]
 
     # -------------------------------------------------------------------------
     #  Laço principal
@@ -826,6 +1083,10 @@ class AjusteDoPid:
 # =============================================================================
 #  Barras e teclas
 # =============================================================================
+
+def valor_permitido_mais_proximo(parametro: Parametro, valor: float) -> float:
+    return min(parametro.valores_permitidos, key=lambda permitido: abs(permitido - valor))
+
 
 def barra_cheia(fracao: float) -> str:
     cheias = round(limitar(fracao, 0.0, 1.0) * LARGURA_DA_BARRA)

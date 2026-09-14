@@ -151,6 +151,9 @@ Comandos pelo Monitor Serial:
 | `pwm_minimo 40` | muda o menor PWM que faz o motor girar |
 | `angulo_queda 35` | muda a inclinação (5 a 80°) a partir da qual o robô "caiu" e o motor desliga |
 | `peso_giroscopio 0.98` | muda quanto o filtro confia no giroscópio (0 a 1); veja abaixo |
+| `divisor_amostragem 4` | muda quantas medições por segundo o MPU6050 faz: 1000 / (1 + divisor) (1 a 19) |
+| `filtro_passa_baixas 3` | muda o filtro interno do MPU6050: 1 = 188 Hz … 6 = 5 Hz (1 a 6) |
+| `escala_acelerometro 2` | muda a faixa do acelerômetro: ±2, ±4, ±8 ou ±16 g (outros valores vão para a mais próxima) |
 | `telemetria` | liga/desliga o envio de números para o computador |
 | `valores` | mostra os valores atuais |
 | `ajuda` | mostra a lista de comandos |
@@ -166,6 +169,34 @@ acelerômetro corrige o ângulo em cerca de 0,25 s (`5 ms × 0,98 / 0,02`). Valo
 menores (0,95) corrigem mais rápido o escorregamento do giroscópio, mas deixam os
 trancos do motor aparecerem no ângulo; valores maiores (0,995) deixam o ângulo mais
 liso, mas demoram mais para corrigir. Em 1, o ângulo escorrega até o robô cair.
+
+**`divisor_amostragem`** e **`filtro_passa_baixas`** vão direto para os
+registradores do MPU6050, sem regravar o sketch:
+
+| `divisor_amostragem` | Medições por segundo | Intervalo |
+|---|---|---|
+| 1 | 500 | 2 ms |
+| 4 (padrão) | 200 | 5 ms |
+| 9 | 100 | 10 ms |
+| 19 | 50 | 20 ms |
+
+| `filtro_passa_baixas` | Corta vibrações acima de | Atraso na leitura |
+|---|---|---|
+| 1 | 188 Hz | 1,9 ms |
+| 2 | 98 Hz | 2,8 ms |
+| 3 (padrão) | 42 Hz | 4,8 ms |
+| 4 | 20 Hz | 8,3 ms |
+| 5 | 10 Hz | 13,4 ms |
+| 6 | 5 Hz | 18,6 ms |
+
+Motor zumbindo e termo D tremendo: suba o filtro. Robô atrasado, oscilando mesmo
+com Kd alto: desça. O divisor também muda a velocidade do filtro complementar,
+porque o `peso_giroscopio` é aplicado a cada medição. Quando o Nano reinicia,
+os dois voltam aos valores escritos no sketch; o `pid-robot` reaplica os do último envio.
+
+**`escala_acelerometro`** não muda nenhuma conta (o ângulo usa só a proporção entre os
+eixos): decide a resolução e a partir de quantos g o sensor satura. ±2 g é o mais fino;
+±4 g aguenta melhor batidas e trancos.
 
 **`angulo_queda`** é a margem de segurança: baixo demais, o robô desiste de
 inclinações que ainda dava para salvar; alto demais, o motor fica girando com ele
@@ -196,8 +227,10 @@ pid-robot --porta /dev/ttyUSB0
 | Tecla | Faz |
 |---|---|
 | `↑` `↓` | escolhe o parâmetro |
-| `←` `→` / `PgUp` `PgDn` | ajusta com passo fino / passo ×10 |
-| `0`–`9` | digita um valor; `Enter` confirma e envia |
+| `←` `→` | ajusta com o passo normal |
+| `+` `-` | ajusta com um décimo do passo (os inteiros andam de 1 em 1) |
+| `PgUp` `PgDn` | ajusta com 10 vezes o passo |
+| `0`–`9` | digita um valor (`-` troca o sinal); `Enter` confirma e envia |
 | `Enter` | envia o parâmetro selecionado |
 | `e` | envia todos |
 | `u` | descarta alterações e volta ao último envio |
@@ -208,6 +241,10 @@ pid-robot --porta /dev/ttyUSB0
 | `q` / `Esc` | sai |
 
 - Cada parâmetro mostra se está **não enviado**, **enviado** ou **confirmado no robô**.
+- Embaixo da tabela, o parâmetro selecionado ganha uma descrição detalhada: o que ele faz,
+  o que acontece ao aumentar ou diminuir e como ajustar, com os números recalculados para o
+  valor na tela. A tela se ajusta à altura do terminal; com menos de ~32 linhas, parte da
+  descrição fica escondida.
 - Mostra ao vivo o ângulo, o comando do motor e os termos P, I e D.
 - O último envio fica guardado em `~/.config/pid-robot/ultimo-envio.json` e volta
   ao abrir o programa. Como o Nano reinicia quando a porta é aberta (e volta aos
