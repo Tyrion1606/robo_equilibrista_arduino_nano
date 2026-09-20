@@ -56,9 +56,21 @@
  *     divisor_amostragem 4    muda quantas medições por segundo o MPU6050 faz (1 a 19)
  *     filtro_passa_baixas 3   muda o filtro interno do MPU6050 (1 a 6)
  *     escala_acelerometro 2   muda a faixa do acelerômetro: ±2, ±4, ±8 ou ±16 g
+ *     usar_filtro_d 1         liga (1) ou desliga (0) o filtro só no termo D
+ *     filtro_termo_d 25       frequência de corte desse filtro, em Hz
+ *     usar_laco_velocidade 1  liga (1) ou desliga (0) o laço de velocidade
+ *     kv 0.02                 ganho do laço de velocidade
+ *     usar_curva 1            liga (1) ou desliga (0) a curva de resposta do motor
+ *     curva_motor 0.5         quanto a curva suaviza perto do zero (0 a 1)
+ *     usar_rampa 1            liga (1) ou desliga (0) a rampa do motor
+ *     rampa_motor 1500        quanto o comando pode mudar por segundo
  *     telemetria              liga/desliga o envio de números para o computador
  *     valores                 mostra os valores atuais
  *     ajuda                   mostra esta lista
+ *
+ *   Cada comando que muda um valor responde "# ok nome=valor". A lista completa
+ *   só sai ao ligar e com "valores": ela é longa, e imprimi-la a cada ajuste
+ *   travaria o controle por dezenas de milissegundos.
  *
  *   Não precisa instalar biblioteca: o MPU6050 é lido direto pelo I2C (Wire).
  * =============================================================================
@@ -213,7 +225,72 @@ const unsigned long INTERVALO_DA_TELEMETRIA_MS = 100;
 
 
 // =============================================================================
-//  4. MPU6050 — endereço e registradores (valores tirados do datasheet)
+//  4. TÉCNICAS PARA SUAVIZAR O MOTOR  (todas começam desligadas)
+// =============================================================================
+//
+//  Cada técnica tem uma chave ("usar_…", 1 liga e 0 desliga) e um valor, e as
+//  duas coisas podem ser mudadas pela serial a qualquer momento. Com todas
+//  desligadas, o robô funciona exatamente como antes de elas existirem.
+//  O caminho do comando é sempre:
+//
+//     PID (com o filtro no D e o laço de velocidade)  →  curva  →  rampa  →  motor
+//
+//  FILTRO NO TERMO D  ("usar_filtro_d", "filtro_termo_d")
+//    O termo D multiplica a velocidade medida pelo giroscópio, que traz junto a
+//    vibração do motor: é o termo que mais faz o comando pular. Este filtro
+//    passa-baixas suaviza só a velocidade usada no D. O valor é a frequência de
+//    corte em hertz: o que muda mais devagar que isso passa, o que vibra mais
+//    rápido é atenuado. Assim dá para deixar o filtro_passa_baixas do MPU6050
+//    mais fraco (menos atraso para o ângulo e o P) e filtrar só onde precisa.
+//    Mais baixo = D mais liso, porém mais atrasado.
+//
+//  LAÇO DE VELOCIDADE  ("usar_laco_velocidade", "kv")
+//    Um robô que só olha o ângulo tende a ir acelerando para um lado até o
+//    motor saturar. Não há encoder, então a velocidade das rodas é estimada
+//    pelo próprio comando mandado ao motor. Quando o robô vem andando, o laço
+//    inclina o alvo para o lado contrário, porque para frear ele precisa se
+//    inclinar para trás. kv = graus de inclinação do alvo por unidade de
+//    comando: com 0.02 e o robô andando com comando médio de 100, o alvo
+//    inclina 2° para trás.
+//
+//  CURVA DE RESPOSTA  ("usar_curva", "curva_motor")
+//    Troca a linha reta entre o comando do PID e o motor por uma curva: suave
+//    perto do zero, onde o robô passa a maior parte do tempo, e forte perto de
+//    255, que continua disponível para salvar uma queda.
+//
+//        x = |comando| / 255        saída = 255 × ((1 − curva) × x + curva × x³)
+//
+//    curva 0 = reta (igual a não usar); curva 1 = cúbica, a mais suave no zero.
+//
+//  RAMPA  ("usar_rampa", "rampa_motor")
+//    Limita quanto o comando pode mudar por segundo, em unidades de PWM. Com
+//    1500, ir de 0 a 255 leva 0,17 s. Tira trancos e picos de corrente, mas
+//    atrasa as correções grandes: rampa lenta demais e o robô cai.
+
+bool  usarFiltroNoTermoD = false;
+float frequenciaDoFiltroDoTermoD = 25.0;          // Hz
+const float FREQUENCIA_DO_FILTRO_DO_TERMO_D_MINIMA = 1.0;
+const float FREQUENCIA_DO_FILTRO_DO_TERMO_D_MAXIMA = 150.0;
+
+bool  usarLacoDeVelocidade = false;
+float Kv = 0.02;                                  // graus de alvo por unidade de comando
+const float KV_MAXIMO = 0.5;
+const float LIMITE_DA_INCLINACAO_DO_LACO = 10.0;  // o laço nunca inclina o alvo mais que isto
+// O motor e o robô não mudam de velocidade na hora: a velocidade estimada segue
+// o comando aos poucos, com esta constante de tempo (típica de um motor TT).
+const float CONSTANTE_DE_TEMPO_DA_VELOCIDADE = 0.3;   // segundos
+
+bool  usarCurva = false;
+float curvaDoMotor = 0.5;                         // 0 = reta, 1 = cúbica
+
+bool  usarRampa = false;
+float rampaDoMotor = 1500.0;                      // unidades de PWM por segundo
+const float RAMPA_DO_MOTOR_MINIMA = 50.0;
+const float RAMPA_DO_MOTOR_MAXIMA = 20000.0;
+
+
+// =============================================================================
+//  5. MPU6050 — endereço e registradores (valores tirados do datasheet)
 // =============================================================================
 
 const uint8_t ENDERECO_MPU6050 = 0x68;   // com o pino AD0 solto ou em GND
@@ -232,7 +309,7 @@ const float UNIDADES_POR_GRAU_POR_SEGUNDO = 65.5;
 
 
 // =============================================================================
-//  5. ESTADO DO ROBÔ (valores que mudam enquanto ele funciona)
+//  6. ESTADO DO ROBÔ (valores que mudam enquanto ele funciona)
 // =============================================================================
 
 // Uma leitura completa do sensor, em unidades "cruas" (ainda sem conversão).
@@ -248,7 +325,12 @@ float desvioDoGiroscopio = 0.0;  // graus/s que o giroscópio marca mesmo parado
 float termoIntegral = 0.0;       // a "memória" do PID, já em unidades de comando
 float ultimoTermoP  = 0.0;       // P e D guardados só para aparecer na telemetria
 float ultimoTermoD  = 0.0;
-float ultimoComando = 0.0;       // o que foi pedido ao motor por último
+float ultimoComando = 0.0;       // o que foi pedido ao motor por último (depois da curva e da rampa)
+float ultimoComandoDoPid = 0.0;  // o que o PID pediu, antes da curva e da rampa
+float ultimoTermoV  = 0.0;       // graus que o laço de velocidade somou ao alvo
+
+float velocidadeFiltradaParaD = 0.0;  // graus/s: a velocidade do giroscópio depois do filtro do termo D
+float velocidadeEstimada      = 0.0;  // unidades de comando: para que lado e quão forte o robô vem andando
 
 bool equilibrando = false;       // false = caído, esperando ser levantado
 
@@ -377,8 +459,9 @@ void loop() {
       pararMotor();
       Serial.println(F("# Caiu. Levante o robo para recomecar."));
     } else {
-      float comando = calcularPID(segundosDesdeOUltimoCiclo);
-      acionarMotor(comando);
+      float comandoDoPid = calcularPID(segundosDesdeOUltimoCiclo);
+      acionarMotor(suavizarComando(comandoDoPid, segundosDesdeOUltimoCiclo));
+      atualizarVelocidadeEstimada(segundosDesdeOUltimoCiclo);
     }
   } else if (distanciaDoEquilibrio < ANGULO_PARA_REARMAR) {
     // Alguém levantou o robô até perto do equilíbrio: começa do zero.
@@ -529,12 +612,22 @@ void calibrarGiroscopio() {
 //  Sai:   um comando para o motor, de -255 (ré total) a +255 (frente total).
 
 float calcularPID(float segundosDesdeOUltimoCiclo) {
-  // ERRO: quantos graus estamos longe do equilíbrio.
+  // ALVO: normalmente é o ângulo de equilíbrio. Com o laço de velocidade
+  // ligado, andando para a frente o alvo inclina para trás (e vice-versa), que
+  // é o que faz o robô frear. Veja a seção 4.
+  float correcaoDoAlvo = 0.0;
+  if (usarLacoDeVelocidade) {
+    correcaoDoAlvo = constrain(-Kv * velocidadeEstimada, -LIMITE_DA_INCLINACAO_DO_LACO, LIMITE_DA_INCLINACAO_DO_LACO);
+  }
+  ultimoTermoV = correcaoDoAlvo;
+  float alvo = anguloDeEquilibrio + correcaoDoAlvo;
+
+  // ERRO: quantos graus estamos longe do alvo.
   // Positivo = tombando para a frente = as rodas precisam ir para a frente
   // para "passar por baixo" do robô. Por isso o erro é (atual − alvo), e não
   // (alvo − atual) como costuma aparecer nos livros: assim a correção já sai
   // com o sinal certo e todos os ganhos ficam positivos.
-  float erro = anguloAtual - anguloDeEquilibrio;
+  float erro = anguloAtual - alvo;
 
   // P — PROPORCIONAL: quanto maior a inclinação, mais força.
   float termoP = Kp * erro;
@@ -549,17 +642,62 @@ float calcularPID(float segundosDesdeOUltimoCiclo) {
   // fixo, essa velocidade é exatamente o que o giroscópio mede. Usar o
   // giroscópio direto dá um sinal muito mais limpo do que fazer
   // (erro atual − erro anterior) / tempo, que amplifica o ruído.
-  float termoD = Kd * velocidadeAngular;
+  float termoD = Kd * velocidadeParaOTermoD(segundosDesdeOUltimoCiclo);
 
   ultimoTermoP = termoP;
   ultimoTermoD = termoD;
 
-  float comando = termoP + termoIntegral + termoD;
-  return constrain(comando, -PWM_MAXIMO, PWM_MAXIMO);
+  float comando = constrain(termoP + termoIntegral + termoD, -PWM_MAXIMO, PWM_MAXIMO);
+  ultimoComandoDoPid = comando;
+  return comando;
 }
 
+// FILTRO NO TERMO D: passa-baixas de primeira ordem. A cada medição, a saída
+// anda uma fração "alfa" do caminho até o valor novo. Alfa sai da frequência
+// de corte: quanto mais baixa, menor o passo e mais liso (e atrasado) o sinal.
+float velocidadeParaOTermoD(float segundosDesdeOUltimoCiclo) {
+  if (!usarFiltroNoTermoD) {
+    velocidadeFiltradaParaD = velocidadeAngular;   // fica pronta para quando o filtro for ligado
+    return velocidadeAngular;
+  }
+  float constanteDeTempo = 1.0 / (2.0 * PI * frequenciaDoFiltroDoTermoD);
+  float alfa = segundosDesdeOUltimoCiclo / (segundosDesdeOUltimoCiclo + constanteDeTempo);
+  velocidadeFiltradaParaD += alfa * (velocidadeAngular - velocidadeFiltradaParaD);
+  return velocidadeFiltradaParaD;
+}
+
+// LAÇO DE VELOCIDADE: como o motor não muda de velocidade na hora, a velocidade
+// estimada segue o comando aos poucos (o mesmo passa-baixas, com constante de
+// tempo de 0,3 s). Não é a velocidade real, mas diz para que lado e quão forte
+// o robô vem andando. É atualizada sempre, para estar pronta quando o laço ligar.
+void atualizarVelocidadeEstimada(float segundosDesdeOUltimoCiclo) {
+  float alfa = segundosDesdeOUltimoCiclo / (segundosDesdeOUltimoCiclo + CONSTANTE_DE_TEMPO_DA_VELOCIDADE);
+  velocidadeEstimada += alfa * (ultimoComando - velocidadeEstimada);
+}
+
+// CURVA e RAMPA: mexem no comando que já saiu do PID, antes de ele ir para o
+// motor. Veja a seção 4.
+float suavizarComando(float comando, float segundosDesdeOUltimoCiclo) {
+  if (usarCurva) {
+    float x = fabs(comando) / PWM_MAXIMO;                                  // 0 a 1, sem o sinal
+    float y = (1.0 - curvaDoMotor) * x + curvaDoMotor * x * x * x;
+    comando = (comando < 0 ? -y : y) * PWM_MAXIMO;
+  }
+
+  if (usarRampa) {
+    // Compara com o que foi mandado ao motor no ciclo anterior.
+    float variacaoMaxima = rampaDoMotor * segundosDesdeOUltimoCiclo;
+    comando = constrain(comando, ultimoComando - variacaoMaxima, ultimoComando + variacaoMaxima);
+  }
+
+  return comando;
+}
+
+// Começa do zero quando o robô é levantado: nada do que foi acumulado caído vale.
 void zerarPID() {
   termoIntegral = 0.0;
+  velocidadeEstimada = 0.0;
+  velocidadeFiltradaParaD = velocidadeAngular;
 }
 
 
@@ -758,6 +896,16 @@ void lerComandosDaSerial() {
   }
 }
 
+// Todos os ajustes, na ordem em que "valores" mostra. O pid-robot espera "kp"
+// primeiro e "telemetria" por último.
+const char *const NOMES_DOS_AJUSTES[] = {
+  "kp", "ki", "kd", "angulo_equilibrio", "angulo_queda", "usar_laco_velocidade", "kv",
+  "pwm_minimo", "usar_filtro_d", "filtro_termo_d", "usar_curva", "curva_motor", "usar_rampa", "rampa_motor",
+  "peso_giroscopio", "divisor_amostragem", "filtro_passa_baixas", "escala_acelerometro",
+  "telemetria",
+};
+const int QUANTIDADE_DE_AJUSTES = sizeof(NOMES_DOS_AJUSTES) / sizeof(NOMES_DOS_AJUSTES[0]);
+
 // Recebe uma linha como "kp 25" ou "marcar_equilibrio" e faz o que ela pede.
 void executarComando(char *linha) {
   // Separa a linha no primeiro espaço: "kp 25" vira nome "kp" e valor "25".
@@ -772,26 +920,51 @@ void executarComando(char *linha) {
     veioComValor = (strpbrk(valorEmTexto, "0123456789") != NULL);
     valor = atof(valorEmTexto);
   }
+  strlwr(nome);                    // "KP" vira "kp", para responder com o nome certo
 
-  // Comandos que mudam um número precisam vir com o número. Sem ele, avisamos
-  // em vez de zerar o valor sem querer.
-  bool precisaDeValor = nomeDoComandoE(nome, "kp") ||
-                        nomeDoComandoE(nome, "ki") ||
-                        nomeDoComandoE(nome, "kd") ||
-                        nomeDoComandoE(nome, "angulo_equilibrio") ||
-                        nomeDoComandoE(nome, "pwm_minimo") ||
-                        nomeDoComandoE(nome, "angulo_queda") ||
-                        nomeDoComandoE(nome, "peso_giroscopio") ||
-                        nomeDoComandoE(nome, "divisor_amostragem") ||
-                        nomeDoComandoE(nome, "filtro_passa_baixas") ||
-                        nomeDoComandoE(nome, "escala_acelerometro");
-  if (precisaDeValor && !veioComValor) {
+  // Comandos que não levam número.
+  if (nomeDoComandoE(nome, "ajuda")) {
+    mostrarAjuda();
+    return;
+  }
+  if (nomeDoComandoE(nome, "valores")) {
+    mostrarAjustes();
+    return;
+  }
+  if (nomeDoComandoE(nome, "marcar_equilibrio")) {
+    anguloDeEquilibrio = anguloAtual;
+    confirmarAjuste("angulo_equilibrio");
+    return;
+  }
+  if (nomeDoComandoE(nome, "telemetria")) {
+    telemetriaLigada = !telemetriaLigada;
+    confirmarAjuste("telemetria");
+    return;
+  }
+
+  // Os outros mudam um valor e precisam do número. Sem ele, avisamos em vez de
+  // zerar o valor sem querer.
+  if (!ajusteExiste(nome)) {
+    Serial.print(F("# Comando desconhecido: \""));
+    Serial.print(nome);
+    Serial.println(F("\""));
+    mostrarAjuda();
+    return;
+  }
+  if (!veioComValor) {
     Serial.print(F("# Faltou o numero depois de \""));
     Serial.print(nome);
     Serial.println(F("\". Exemplo: kp 20"));
     return;
   }
+  if (aplicarAjuste(nome, valor)) {
+    confirmarAjuste(nome);
+  }
+}
 
+// Muda um ajuste, respeitando os limites. Devolve false se não deu certo
+// (o MPU6050 recusou a mudança, por exemplo).
+bool aplicarAjuste(const char *nome, float valor) {
   if (nomeDoComandoE(nome, "kp")) {
     Kp = valor;
   } else if (nomeDoComandoE(nome, "ki")) {
@@ -800,53 +973,96 @@ void executarComando(char *linha) {
     Kd = valor;
   } else if (nomeDoComandoE(nome, "angulo_equilibrio")) {
     anguloDeEquilibrio = valor;
-  } else if (nomeDoComandoE(nome, "marcar_equilibrio")) {
-    anguloDeEquilibrio = anguloAtual;
-  } else if (nomeDoComandoE(nome, "pwm_minimo")) {
-    pwmMinimo = constrain((int)valor, 0, PWM_MAXIMO - 1);
   } else if (nomeDoComandoE(nome, "angulo_queda")) {
     anguloDeQueda = constrain(valor, ANGULO_DE_QUEDA_MINIMO, ANGULO_DE_QUEDA_MAXIMO);
+  } else if (nomeDoComandoE(nome, "usar_laco_velocidade")) {
+    usarLacoDeVelocidade = (valor != 0);
+  } else if (nomeDoComandoE(nome, "kv")) {
+    Kv = constrain(valor, 0.0, KV_MAXIMO);
+  } else if (nomeDoComandoE(nome, "pwm_minimo")) {
+    pwmMinimo = constrain((int)valor, 0, PWM_MAXIMO - 1);
+  } else if (nomeDoComandoE(nome, "usar_filtro_d")) {
+    usarFiltroNoTermoD = (valor != 0);
+  } else if (nomeDoComandoE(nome, "filtro_termo_d")) {
+    frequenciaDoFiltroDoTermoD = constrain(valor, FREQUENCIA_DO_FILTRO_DO_TERMO_D_MINIMA,
+                                           FREQUENCIA_DO_FILTRO_DO_TERMO_D_MAXIMA);
+  } else if (nomeDoComandoE(nome, "usar_curva")) {
+    usarCurva = (valor != 0);
+  } else if (nomeDoComandoE(nome, "curva_motor")) {
+    curvaDoMotor = constrain(valor, 0.0, 1.0);
+  } else if (nomeDoComandoE(nome, "usar_rampa")) {
+    usarRampa = (valor != 0);
+  } else if (nomeDoComandoE(nome, "rampa_motor")) {
+    rampaDoMotor = constrain(valor, RAMPA_DO_MOTOR_MINIMA, RAMPA_DO_MOTOR_MAXIMA);
   } else if (nomeDoComandoE(nome, "peso_giroscopio")) {
     pesoDoGiroscopio = constrain(valor, 0.0, 1.0);
   } else if (nomeDoComandoE(nome, "divisor_amostragem")) {
     // Vai direto para o sensor. Só guarda o valor novo se ele aceitar: assim o
     // que aparece em "valores" é sempre o que está gravado no MPU6050.
     uint8_t novoDivisor = constrain((int)valor, DIVISOR_DE_AMOSTRAGEM_MINIMO, DIVISOR_DE_AMOSTRAGEM_MAXIMO);
-    if (escreverRegistrador(REG_DIVISOR_DE_AMOSTRAGEM, novoDivisor)) {
-      divisorDeAmostragem = novoDivisor;
-    } else {
+    if (!escreverRegistrador(REG_DIVISOR_DE_AMOSTRAGEM, novoDivisor)) {
       Serial.println(F("# ERRO: o MPU6050 nao aceitou o divisor de amostragem."));
+      return false;
     }
+    divisorDeAmostragem = novoDivisor;
   } else if (nomeDoComandoE(nome, "filtro_passa_baixas")) {
     uint8_t novoFiltro = constrain((int)valor, FILTRO_PASSA_BAIXAS_MINIMO, FILTRO_PASSA_BAIXAS_MAXIMO);
-    if (escreverRegistrador(REG_FILTRO_PASSA_BAIXAS, novoFiltro)) {
-      filtroPassaBaixas = novoFiltro;
-    } else {
+    if (!escreverRegistrador(REG_FILTRO_PASSA_BAIXAS, novoFiltro)) {
       Serial.println(F("# ERRO: o MPU6050 nao aceitou o filtro passa-baixas."));
+      return false;
     }
+    filtroPassaBaixas = novoFiltro;
   } else if (nomeDoComandoE(nome, "escala_acelerometro")) {
     uint8_t novaEscala = escalaDoAcelerometroMaisProxima(valor);
-    if (escreverRegistrador(REG_ESCALA_ACELEROMETRO, valorDoRegistradorDeEscala(novaEscala))) {
-      escalaDoAcelerometroEmG = novaEscala;
-    } else {
+    if (!escreverRegistrador(REG_ESCALA_ACELEROMETRO, valorDoRegistradorDeEscala(novaEscala))) {
       Serial.println(F("# ERRO: o MPU6050 nao aceitou a escala do acelerometro."));
+      return false;
     }
-  } else if (nomeDoComandoE(nome, "telemetria")) {
-    telemetriaLigada = !telemetriaLigada;
-  } else if (nomeDoComandoE(nome, "valores")) {
-    // nada a mudar: só mostra os valores logo abaixo
-  } else if (nomeDoComandoE(nome, "ajuda")) {
-    mostrarAjuda();
-    return;
-  } else {
-    Serial.print(F("# Comando desconhecido: \""));
-    Serial.print(nome);
-    Serial.println(F("\""));
-    mostrarAjuda();
-    return;
+    escalaDoAcelerometroEmG = novaEscala;
   }
+  return true;
+}
 
-  mostrarAjustes();
+// Escreve "nome=valor" de um ajuste, com as mesmas casas decimais que o
+// pid-robot espera.
+void mostrarAjuste(const char *nome) {
+  Serial.print(nome);
+  Serial.print('=');
+  if      (nomeDoComandoE(nome, "kp"))                   Serial.print(Kp, 2);
+  else if (nomeDoComandoE(nome, "ki"))                   Serial.print(Ki, 2);
+  else if (nomeDoComandoE(nome, "kd"))                   Serial.print(Kd, 3);
+  else if (nomeDoComandoE(nome, "angulo_equilibrio"))    Serial.print(anguloDeEquilibrio, 2);
+  else if (nomeDoComandoE(nome, "angulo_queda"))         Serial.print(anguloDeQueda, 1);
+  else if (nomeDoComandoE(nome, "usar_laco_velocidade")) Serial.print(usarLacoDeVelocidade ? 1 : 0);
+  else if (nomeDoComandoE(nome, "kv"))                   Serial.print(Kv, 3);
+  else if (nomeDoComandoE(nome, "pwm_minimo"))           Serial.print(pwmMinimo);
+  else if (nomeDoComandoE(nome, "usar_filtro_d"))        Serial.print(usarFiltroNoTermoD ? 1 : 0);
+  else if (nomeDoComandoE(nome, "filtro_termo_d"))       Serial.print(frequenciaDoFiltroDoTermoD, 1);
+  else if (nomeDoComandoE(nome, "usar_curva"))           Serial.print(usarCurva ? 1 : 0);
+  else if (nomeDoComandoE(nome, "curva_motor"))          Serial.print(curvaDoMotor, 2);
+  else if (nomeDoComandoE(nome, "usar_rampa"))           Serial.print(usarRampa ? 1 : 0);
+  else if (nomeDoComandoE(nome, "rampa_motor"))          Serial.print(rampaDoMotor, 0);
+  else if (nomeDoComandoE(nome, "peso_giroscopio"))      Serial.print(pesoDoGiroscopio, 3);
+  else if (nomeDoComandoE(nome, "divisor_amostragem"))   Serial.print(divisorDeAmostragem);
+  else if (nomeDoComandoE(nome, "filtro_passa_baixas"))  Serial.print(filtroPassaBaixas);
+  else if (nomeDoComandoE(nome, "escala_acelerometro"))  Serial.print(escalaDoAcelerometroEmG);
+  else if (nomeDoComandoE(nome, "telemetria"))           Serial.print(telemetriaLigada ? F("ligada") : F("desligada"));
+}
+
+bool ajusteExiste(const char *nome) {
+  for (int i = 0; i < QUANTIDADE_DE_AJUSTES; i++) {
+    if (nomeDoComandoE(nome, NOMES_DOS_AJUSTES[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Resposta curta a um comando: "# ok kp=22.00".
+void confirmarAjuste(const char *nome) {
+  Serial.print(F("# ok "));
+  mostrarAjuste(nome);
+  Serial.println();
 }
 
 // Compara o nome digitado com o esperado, sem ligar para maiúsculas.
@@ -861,8 +1077,16 @@ void mostrarAjuda() {
   Serial.println(F("#   kd 0.8                  ganho derivativo"));
   Serial.println(F("#   angulo_equilibrio -1.5  angulo em que o robo fica em pe"));
   Serial.println(F("#   marcar_equilibrio       usa o angulo atual como equilibrio"));
-  Serial.println(F("#   pwm_minimo 40           menor PWM que faz o motor girar"));
   Serial.println(F("#   angulo_queda 35         inclinacao a partir da qual o robo caiu (5 a 80)"));
+  Serial.println(F("#   usar_laco_velocidade 1  liga (1) ou desliga (0) o laco de velocidade"));
+  Serial.println(F("#   kv 0.02                 graus de alvo por unidade de comando (0 a 0.5)"));
+  Serial.println(F("#   pwm_minimo 40           menor PWM que faz o motor girar"));
+  Serial.println(F("#   usar_filtro_d 1         liga (1) ou desliga (0) o filtro no termo D"));
+  Serial.println(F("#   filtro_termo_d 25       corte do filtro no termo D, em Hz (1 a 150)"));
+  Serial.println(F("#   usar_curva 1            liga (1) ou desliga (0) a curva do motor"));
+  Serial.println(F("#   curva_motor 0.5         0 = reta, 1 = cubica (0 a 1)"));
+  Serial.println(F("#   usar_rampa 1            liga (1) ou desliga (0) a rampa do motor"));
+  Serial.println(F("#   rampa_motor 1500        variacao maxima do comando por segundo (50 a 20000)"));
   Serial.println(F("#   peso_giroscopio 0.98    quanto o filtro confia no giroscopio (0 a 1)"));
   Serial.println(F("#   divisor_amostragem 4    medicoes por segundo = 1000 / (1 + divisor) (1 a 19)"));
   Serial.println(F("#   filtro_passa_baixas 3   filtro do MPU6050: 1 = 188 Hz ... 6 = 5 Hz (1 a 6)"));
@@ -872,20 +1096,17 @@ void mostrarAjuda() {
   Serial.println(F("#   ajuda                   mostra esta lista"));
 }
 
-// O programa ferramentas/pid-robot lê esta linha e a da telemetria: se mudar o
-// formato de alguma delas, ajuste o programa também.
+// O programa ferramentas/pid-robot lê esta linha, a "# ok" e a da telemetria:
+// se mudar o formato de alguma delas, ajuste o programa também.
 void mostrarAjustes() {
-  Serial.print(F("# kp="));                  Serial.print(Kp, 2);
-  Serial.print(F("  ki="));                  Serial.print(Ki, 2);
-  Serial.print(F("  kd="));                  Serial.print(Kd, 3);
-  Serial.print(F("  angulo_equilibrio="));   Serial.print(anguloDeEquilibrio, 2);
-  Serial.print(F("  pwm_minimo="));          Serial.print(pwmMinimo);
-  Serial.print(F("  angulo_queda="));        Serial.print(anguloDeQueda, 1);
-  Serial.print(F("  peso_giroscopio="));     Serial.print(pesoDoGiroscopio, 3);
-  Serial.print(F("  divisor_amostragem="));  Serial.print(divisorDeAmostragem);
-  Serial.print(F("  filtro_passa_baixas=")); Serial.print(filtroPassaBaixas);
-  Serial.print(F("  escala_acelerometro=")); Serial.print(escalaDoAcelerometroEmG);
-  Serial.print(F("  telemetria="));          Serial.println(telemetriaLigada ? F("ligada") : F("desligada"));
+  Serial.print(F("# "));
+  for (int i = 0; i < QUANTIDADE_DE_AJUSTES; i++) {
+    if (i > 0) {
+      Serial.print(F("  "));
+    }
+    mostrarAjuste(NOMES_DOS_AJUSTES[i]);
+  }
+  Serial.println();
 }
 
 // Formato "nome:valor,nome:valor" — abre direto no Plotter Serial da IDE.
@@ -899,5 +1120,7 @@ void enviarTelemetria() {
   Serial.print(F(",termo_P:"));            Serial.print(ultimoTermoP, 1);
   Serial.print(F(",termo_I:"));            Serial.print(termoIntegral, 1);
   Serial.print(F(",termo_D:"));            Serial.print(ultimoTermoD, 1);
+  Serial.print(F(",termo_V:"));            Serial.print(ultimoTermoV, 2);
+  Serial.print(F(",comando_pid:"));        Serial.print(ultimoComandoDoPid, 0);
   Serial.print(F(",comando_motor:"));      Serial.println(ultimoComando, 0);
 }

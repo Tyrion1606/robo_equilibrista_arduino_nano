@@ -154,15 +154,23 @@ Comandos pelo Monitor Serial:
 | `divisor_amostragem 4` | muda quantas medições por segundo o MPU6050 faz: 1000 / (1 + divisor) (1 a 19) |
 | `filtro_passa_baixas 3` | muda o filtro interno do MPU6050: 1 = 188 Hz … 6 = 5 Hz (1 a 6) |
 | `escala_acelerometro 2` | muda a faixa do acelerômetro: ±2, ±4, ±8 ou ±16 g (outros valores vão para a mais próxima) |
+| `usar_filtro_d 1` / `filtro_termo_d 25` | liga (1) ou desliga (0) o filtro só no termo D / corte em Hz |
+| `usar_laco_velocidade 1` / `kv 0.02` | liga ou desliga o laço de velocidade / graus de alvo por unidade de comando |
+| `usar_curva 1` / `curva_motor 0.5` | liga ou desliga a curva de resposta do motor / 0 = reta, 1 = cúbica |
+| `usar_rampa 1` / `rampa_motor 1500` | liga ou desliga a rampa do motor / variação máxima do comando por segundo |
 | `telemetria` | liga/desliga o envio de números para o computador |
 | `valores` | mostra os valores atuais |
 | `ajuda` | mostra a lista de comandos |
 
 Maiúsculas e minúsculas tanto faz (`KP 20` também funciona).
 
+Cada comando que muda um valor responde só `# ok nome=valor`; a lista completa sai ao
+ligar e com `valores` (imprimi-la a cada ajuste travaria o controle).
+
 A telemetria sai no formato
-`angulo:…,angulo_equilibrio:…,termo_P:…,termo_I:…,termo_D:…,comando_motor:…`
-e pode ser vista como gráfico no **Plotter Serial** da IDE.
+`angulo:…,angulo_equilibrio:…,termo_P:…,termo_I:…,termo_D:…,termo_V:…,comando_pid:…,comando_motor:…`
+e pode ser vista como gráfico no **Plotter Serial** da IDE. `comando_pid` é o que o PID
+pediu; `comando_motor`, o que chegou ao motor depois da curva e da rampa.
 
 **`peso_giroscopio`** decide a mistura do filtro complementar. Com 0,98, o
 acelerômetro corrige o ângulo em cerca de 0,25 s (`5 ms × 0,98 / 0,02`). Valores
@@ -198,6 +206,26 @@ os dois voltam aos valores escritos no sketch; o `pid-robot` reaplica os do últ
 eixos): decide a resolução e a partir de quantos g o sensor satura. ±2 g é o mais fino;
 ±4 g aguenta melhor batidas e trancos.
 
+### Técnicas para o motor não saturar
+
+Quatro técnicas opcionais, **todas desligadas ao ligar o robô**: com elas desligadas ele
+funciona exatamente como antes. Cada uma tem uma chave (`usar_…`) e um valor, e dá para
+ligar, desligar e comparar ao vivo. O comando passa por elas nesta ordem:
+
+```
+PID (com filtro no D e laço de velocidade)  →  curva  →  rampa  →  motor
+```
+
+| Técnica | O que faz | Por onde começar |
+|---|---|---|
+| **Filtro no termo D** (`filtro_termo_d`) | passa-baixas só na velocidade do giroscópio usada pelo D, o termo que mais faz o comando pular | 20 a 30 Hz |
+| **Laço de velocidade** (`kv`) | estima a velocidade das rodas pelo comando e inclina o alvo para trás quando o robô vem andando, para ele frear em vez de fugir até saturar | 0.005 a 0.01 |
+| **Curva de resposta** (`curva_motor`) | `255 × ((1 − curva)·x + curva·x³)`: suave perto do zero, força total perto de 255 | 0.3 a 0.5 |
+| **Rampa** (`rampa_motor`) | limita quanto o comando muda por segundo; tira trancos, mas atrasa correções grandes | 3000 a 5000, e baixar |
+
+Para comparar: ligue uma de cada vez e observe, no `pid-robot`, os termos P/I/D/V e a linha
+do motor ("PID pediu" × o que chegou ao motor).
+
 **`angulo_queda`** é a margem de segurança: baixo demais, o robô desiste de
 inclinações que ainda dava para salvar; alto demais, o motor fica girando com ele
 deitado no chão.
@@ -230,6 +258,7 @@ pid-robot --porta /dev/ttyUSB0
 | `←` `→` | ajusta com o passo normal |
 | `+` `-` | ajusta com um décimo do passo (os inteiros andam de 1 em 1) |
 | `PgUp` `PgDn` | ajusta com 10 vezes o passo |
+| `espaço` | liga/desliga a técnica selecionada (seção "Suavização do motor") e envia na hora |
 | `0`–`9` | digita um valor (`-` troca o sinal); `Enter` confirma e envia |
 | `Enter` | envia o parâmetro selecionado |
 | `e` | envia todos |
@@ -241,10 +270,12 @@ pid-robot --porta /dev/ttyUSB0
 | `q` / `Esc` | sai |
 
 - Cada parâmetro mostra se está **não enviado**, **enviado** ou **confirmado no robô**.
-- Embaixo da tabela, o parâmetro selecionado ganha uma descrição detalhada: o que ele faz,
+- Os parâmetros ficam em três seções: **Controle**, **Suavização do motor** (as técnicas, com
+  "● ligada" / "○ desligada") e **Sensor MPU6050**.
+- Embaixo da lista, o parâmetro selecionado ganha uma descrição detalhada: o que ele faz,
   o que acontece ao aumentar ou diminuir e como ajustar, com os números recalculados para o
-  valor na tela. A tela se ajusta à altura do terminal; com menos de ~32 linhas, parte da
-  descrição fica escondida.
+  valor na tela. A tela se ajusta à altura do terminal: para ver tudo, use umas 45 linhas
+  (terminal maximizado); com menos, a descrição mostra só o começo.
 - Mostra ao vivo o ângulo, o comando do motor e os termos P, I e D.
 - O último envio fica guardado em `~/.config/pid-robot/ultimo-envio.json` e volta
   ao abrir o programa. Como o Nano reinicia quando a porta é aberta (e volta aos
